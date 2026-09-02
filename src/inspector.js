@@ -15,6 +15,7 @@ import { buildCompatibilityReport, buildReport } from "./report.js";
 import { inspectSdkDeprecations } from "./sdk-deprecation-rules.js";
 
 const execFileAsync = promisify(execFile);
+export const defaultCaptureTimeoutMs = 30_000;
 const pluginFactoryNames = "defineBundledChannelEntry|defineChannelPluginEntry|createChatChannelPlugin|definePluginEntry";
 // Bundlers emit unbound calls as (0, sdk.factory)(...), including inline require receivers.
 const compiledFactoryCall = new RegExp(String.raw`\(\s*0\s*,\s*(?:require\s*\(\s*(?:"[^"\r\n]*"|'[^'\r\n]*')\s*\)|[$A-Z_a-z][$\w]*)(?:\s*\.\s*[$A-Z_a-z][$\w]*)*\s*\.\s*(${pluginFactoryNames})\s*\)\s*\(`, "dg");
@@ -209,10 +210,14 @@ export async function captureEntrypoint(entrypoint, options = {}) {
       : path.dirname(resolvedEntrypoint),
   });
   const api = createCaptureApi(apiOptions);
+  const timeoutMs = resolveCaptureTimeoutMs(options);
   try {
-    await register(api);
+    await invokeWithTimeout(() => register(api), timeoutMs);
   } catch (error) {
-    throw classifyCapturePhaseError(error, "registration-execution-error");
+    throw classifyCapturePhaseError(
+      error,
+      error?.failureClass === "capture-timeout" ? "capture-timeout" : "registration-execution-error",
+    );
   }
   const result = {
     status: "captured",
@@ -309,6 +314,40 @@ export function classifyMockSdkCaptureError(error) {
   return enrichCaptureError(error, {
     message: firstMeaningfulErrorLine(rawMessage) ?? "Mock SDK capture failed",
     failureClass: "mock-sdk-capture-error",
+  });
+}
+
+export function resolveCaptureTimeoutMs(options = {}) {
+  if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+    return options.timeoutMs;
+  }
+  const fromEnv = Number.parseInt(
+    String(options.env?.PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS ?? process.env.PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS ?? ""),
+    10,
+  );
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  return defaultCaptureTimeoutMs;
+}
+
+function invokeWithTimeout(invoke, timeoutMs) {
+  const run = Promise.resolve().then(invoke);
+  if (!(timeoutMs > 0)) {
+    return run;
+  }
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(
+        Object.assign(new Error(`In-process capture timed out after ${timeoutMs}ms`), {
+          failureClass: "capture-timeout",
+        }),
+      );
+    }, timeoutMs);
+  });
+  return Promise.race([run, timeout]).finally(() => {
+    clearTimeout(timeoutId);
   });
 }
 

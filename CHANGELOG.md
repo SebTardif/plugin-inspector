@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Time out in-process `--real-sdk` capture after 30 seconds so a plugin `register()` that never settles cannot hang the inspector.
+
 - Capture plugins that bind `api.runtime.modelAuth` during registration with credential-free defaults; auth acquisition remains an explicit synthetic failure.
 
 ## 0.3.24 - 2026-08-31

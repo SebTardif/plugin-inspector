@@ -246,6 +246,11 @@ including when channel, provider, or lifecycle execution is enabled.
 Use `--real-sdk` only when the plugin workspace already has real SDK
 dependencies installed and you intentionally want that path.
 
+Real-SDK capture imports the plugin in-process. If `register()` never
+settles, capture fails with `capture-timeout` after 30 seconds instead
+of hanging. Override the budget with `timeoutMs` or
+`PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS`.
+
 Runtime capture writes:
 
 - `reports/plugin-inspector-runtime-capture.json`

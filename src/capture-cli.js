@@ -8,6 +8,9 @@ try {
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;
+  if (error.failureClass === "capture-timeout") {
+    process.exit(1);
+  }
 }
 
 async function run(commandArgs) {
