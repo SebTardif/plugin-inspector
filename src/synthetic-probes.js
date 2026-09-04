@@ -1,5 +1,21 @@
 import { renderPaddedMarkdownTable, writeJsonMarkdownArtifacts } from "./artifacts.js";
 
+export const defaultProbeTimeoutMs = 30_000;
+
+export function resolveProbeTimeoutMs(options = {}) {
+  if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+    return options.timeoutMs;
+  }
+  const fromEnv = Number.parseInt(
+    String(options.env?.PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS ?? process.env.PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS ?? ""),
+    10,
+  );
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  return defaultProbeTimeoutMs;
+}
+
 export const syntheticRegistrationExecutionProfiles = {
   createChatChannelPlugin: {
     mode: "metadata-only",
@@ -599,6 +615,7 @@ export async function writeSyntheticProbePlan(plan, options = {}) {
 export async function runCapturedSyntheticProbes(capture, options = {}) {
   const hookEvents = options.hookEvents ?? defaultSyntheticHookEvents;
   const hookContexts = options.hookContexts ?? defaultSyntheticHookContexts;
+  const timeoutMs = resolveProbeTimeoutMs(options);
   const captured = capture.captured ?? [];
   const retained = new Map((capture.retained ?? []).map((item) => [item.captureIndex, item]));
   const resultsByCaptureIndex = new Map();
@@ -618,14 +635,14 @@ export async function runCapturedSyntheticProbes(capture, options = {}) {
     }
     if (entry.kind === "hook") {
       resultsByCaptureIndex.set(captureIndex, [
-        await runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, hookContexts }),
+        await runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, hookContexts, timeoutMs }),
       ]);
       continue;
     }
     if (entry.kind === "registration") {
       resultsByCaptureIndex.set(
         captureIndex,
-        await runRegistrationProbes(entry, retainedEntry, captureIndex, options),
+        await runRegistrationProbes(entry, retainedEntry, captureIndex, { ...options, timeoutMs }),
       );
     }
   }
@@ -719,7 +736,7 @@ function probeBlocker({ hasSyntheticArguments, execution }) {
   return null;
 }
 
-async function runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, hookContexts }) {
+async function runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, hookContexts, timeoutMs }) {
   if (typeof retainedEntry.handler !== "function") {
     return blockedResult(entry, captureIndex, "captured hook has no callable handler");
   }
@@ -728,6 +745,7 @@ async function runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, ho
     kind: "hook",
     seam: entry.name,
     label: entry.name,
+    timeoutMs,
     invoke: () =>
       retainedEntry.handler(
         hookEvents[entry.name] ?? { hook: entry.name },
@@ -766,6 +784,7 @@ async function runRegistrationProbes(entry, retainedEntry, captureIndex, options
         kind: "registration",
         seam: entry.name,
         label: invocation.label,
+        timeoutMs: options.timeoutMs,
         invoke: invocation.invoke,
       }),
     ),
@@ -965,9 +984,9 @@ function speechProbeArgs(event) {
   ];
 }
 
-async function runProbe({ captureIndex, kind, seam, label, invoke }) {
+async function runProbe({ captureIndex, kind, seam, label, invoke, timeoutMs }) {
   try {
-    const output = await invoke();
+    const output = await invokeWithTimeout(invoke, timeoutMs);
     return {
       captureIndex,
       kind,
@@ -986,6 +1005,23 @@ async function runProbe({ captureIndex, kind, seam, label, invoke }) {
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+function invokeWithTimeout(invoke, timeoutMs) {
+  const result = Promise.resolve().then(invoke);
+  if (!(timeoutMs > 0)) {
+    return result;
+  }
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`Synthetic probe timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([result, timeout]).finally(() => {
+    clearTimeout(timeoutId);
+    result.catch(() => {});
+  });
 }
 
 function blockedResult(entry, captureIndex, reason) {

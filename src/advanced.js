@@ -205,10 +205,12 @@ export { createMockSdkPackage } from "./sdk-mock.js";
 export { runEntrypointSyntheticProbes } from "./synthetic-entrypoint.js";
 export {
   buildSyntheticProbePlan,
+  defaultProbeTimeoutMs,
   defaultSyntheticHookContexts,
   defaultSyntheticHookEvents,
   defaultSyntheticRegistrationArguments,
   renderSyntheticProbeMarkdown,
+  resolveProbeTimeoutMs,
   runCapturedSyntheticProbes,
   syntheticRegistrationExecutionProfiles,
   validateSyntheticProbePlan,

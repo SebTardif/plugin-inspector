@@ -7,9 +7,11 @@ import {
   buildSyntheticProbePlan,
   captureEntrypoint,
   createCaptureApi,
+  defaultProbeTimeoutMs,
   defaultSyntheticHookContexts,
   defaultSyntheticHookEvents,
   renderSyntheticProbeMarkdown,
+  resolveProbeTimeoutMs,
   runCapturedSyntheticProbes,
   runEntrypointSyntheticProbes,
   validateSyntheticProbePlan,
@@ -386,6 +388,27 @@ test("synthetic probes keep opt-in registrations guarded", async () => {
   const executed = await runCapturedSyntheticProbes(capture, { includeLifecycle: true });
   assert.equal(executed.summary.passCount, 1);
   assert.equal(executed.results[0].label, "registerService.start");
+});
+
+test("default synthetic probe timeout matches the 30s capture budget", () => {
+  assert.equal(defaultProbeTimeoutMs, 30_000);
+  assert.equal(resolveProbeTimeoutMs({}), 30_000);
+  assert.equal(resolveProbeTimeoutMs({ timeoutMs: 50 }), 50);
+});
+
+test("synthetic probes fail a hanging invoke instead of waiting forever", { timeout: 2000 }, async () => {
+  const capture = await captureLocalFixture([
+    "export function register(api) {",
+    "  api.on('before_tool_call', () => new Promise(() => {}));",
+    "}",
+  ]);
+
+  const result = await runCapturedSyntheticProbes(capture, { timeoutMs: 50 });
+
+  assert.equal(result.summary.failCount, 1);
+  assert.equal(result.results[0].status, "fail");
+  assert.equal(result.results[0].label, "before_tool_call");
+  assert.match(result.results[0].error, /timed out after 50ms/);
 });
 
 test("mock SDK capture preserves retained registration metadata across subprocesses", async () => {
