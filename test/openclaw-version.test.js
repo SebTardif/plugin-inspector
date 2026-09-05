@@ -63,6 +63,102 @@ test("targets without verifiable npm integrity metadata are rejected", async (t)
   );
 });
 
+test("hung OpenClaw metadata fetch is aborted", { timeout: 3_000 }, async (t) => {
+  const fixture = await createRegistryFixture(t, { hangMetadata: true });
+
+  await assert.rejects(
+    () =>
+      resolveOpenClawTargetVersion("latest", {
+        registryUrl: fixture.registryUrl,
+        fetchTimeoutMs: 80,
+      }),
+    (error) => {
+      assert.equal(error.failureClass, "target-download-timeout");
+      assert.match(error.message, /npm metadata download timed out/);
+      return true;
+    },
+  );
+});
+
+test("hung OpenClaw archive fetch is aborted", { timeout: 3_000 }, async (t) => {
+  const fixture = await createRegistryFixture(t, { hangArchive: true });
+  const target = await resolveOpenClawTargetVersion("beta", {
+    registryUrl: fixture.registryUrl,
+    fetchTimeoutMs: 80,
+  });
+
+  await assert.rejects(
+    () =>
+      prepareOpenClawTarget(target, {
+        cacheDir: fixture.cacheDir,
+        fetchTimeoutMs: 80,
+      }),
+    (error) => {
+      assert.equal(error.failureClass, "target-download-timeout");
+      assert.match(error.message, /npm archive download timed out/);
+      return true;
+    },
+  );
+});
+
+test("oversized OpenClaw archive is rejected before buffering", { timeout: 3_000 }, async (t) => {
+  const fixture = await createRegistryFixture(t);
+  const target = await resolveOpenClawTargetVersion("beta", { registryUrl: fixture.registryUrl });
+  let arrayBufferCalled = false;
+  const fetchImpl = async (url, init) => {
+    const response = await fetch(url, init);
+    if (!String(url).includes(".tgz")) return response;
+    return {
+      ok: true,
+      headers: new Headers({ "content-length": String(2 * 1024 * 1024) }),
+      body: null,
+      async arrayBuffer() {
+        arrayBufferCalled = true;
+        return response.arrayBuffer();
+      },
+    };
+  };
+
+  await assert.rejects(
+    () =>
+      prepareOpenClawTarget(target, {
+        cacheDir: fixture.cacheDir,
+        fetch: fetchImpl,
+        maxArchiveBytes: 1024,
+      }),
+    (error) => {
+      assert.equal(error.failureClass, "target-download-too-large");
+      assert.match(error.message, /download limit/);
+      return true;
+    },
+  );
+  assert.equal(arrayBufferCalled, false);
+});
+
+test("public CLI aborts a hung --openclaw-version fetch", { timeout: 8_000 }, async (t) => {
+  const fixture = await createRegistryFixture(t, { hangMetadata: true });
+  const pluginRoot = await createHonchoPlugin(t, ">=2026.3.22");
+  const cliPath = path.resolve("src/cli.js");
+
+  await assert.rejects(
+    () =>
+      execFileAsync(process.execPath, [cliPath, "check", "--plugin-root", pluginRoot, "--openclaw-version", "latest"], {
+        cwd: pluginRoot,
+        timeout: 4_000,
+        env: {
+          ...process.env,
+          PLUGIN_INSPECTOR_CACHE_DIR: fixture.cacheDir,
+          PLUGIN_INSPECTOR_NPM_REGISTRY: fixture.registryUrl,
+          PLUGIN_INSPECTOR_TARGET_FETCH_TIMEOUT_MS: "80",
+        },
+      }),
+    (error) => {
+      assert.match(error.stderr, /npm metadata download timed out/);
+      return true;
+    },
+  );
+});
+
 test("failed target extraction finishes filesystem work before removing its workspace", async (t) => {
   const fixture = await createRegistryFixture(t, { invalidArchiveHeader: true });
   const target = await resolveOpenClawTargetVersion("beta", { registryUrl: fixture.registryUrl });
@@ -394,6 +490,12 @@ async function createRegistryFixture(t, options = {}) {
   const server = createServer(async (request, response) => {
     requests.push(request.url);
     const requestUrl = new URL(request.url, registryUrl(server));
+    if (options.hangMetadata && (requestUrl.pathname === "/openclaw" || requestUrl.pathname.startsWith("/openclaw/"))) {
+      return;
+    }
+    if (options.hangArchive && requestUrl.pathname.endsWith(".tgz")) {
+      return;
+    }
     if (requestUrl.pathname === "/openclaw") {
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify({ "dist-tags": distTags }));
@@ -424,7 +526,10 @@ async function createRegistryFixture(t, options = {}) {
     response.end("not found");
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
   t.after(() => rm(rootDir, { recursive: true, force: true }));
 
   return { cacheDir, distMetadata, distTags, registryUrl: registryUrl(server), requests };
