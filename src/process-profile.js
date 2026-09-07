@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
+export const defaultProfileTimeoutMs = 30_000;
+export const defaultProfileMaxOutputBytes = 1024 * 1024;
+
 export async function runProfiledProcess(options) {
   const start = performance.now();
   const heapStartMb = heapUsedMb();
@@ -13,14 +16,20 @@ export async function runProfiledProcess(options) {
   const cpuSamples = [];
   let pollInFlight = false;
   const pendingStats = new Set();
+  const timeoutMs = resolveProfileTimeoutMs(options);
+  const maxOutputBytes = resolveProfileMaxOutputBytes(options);
+  let timedOut = false;
+  let poll;
+  let timeoutId;
+  let forceKillId;
 
   const child = spawn(options.command, options.args ?? [], {
     cwd: options.cwd,
     env: options.env,
     stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
   });
-  const stdout = [];
-  const stderr = [];
+  const stdout = createCappedCollector(maxOutputBytes);
+  const stderr = createCappedCollector(maxOutputBytes);
   child.stdout?.on("data", (chunk) => stdout.push(chunk));
   child.stderr?.on("data", (chunk) => stderr.push(chunk));
 
@@ -60,45 +69,117 @@ export async function runProfiledProcess(options) {
     pendingStats.add(pending);
   };
 
-  sampleStats();
-  const poll = setInterval(sampleStats, options.pollMs ?? 25);
-
-  const exitCode = await new Promise((resolve, reject) => {
-    child.on("error", (error) => {
+  const stopWatching = () => {
+    if (poll !== undefined) {
       clearInterval(poll);
-      reject(error);
+      poll = undefined;
+    }
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+      timeoutId = undefined;
+    }
+    if (forceKillId !== undefined) {
+      clearTimeout(forceKillId);
+      forceKillId = undefined;
+    }
+  };
+
+  sampleStats();
+  poll = setInterval(sampleStats, options.pollMs ?? 25);
+
+  try {
+    const exitCode = await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (fn) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        stopWatching();
+        fn();
+      };
+      child.on("error", (error) => finish(() => reject(error)));
+      child.on("exit", (code) => finish(() => resolve(code ?? 1)));
+      if (timeoutMs > 0) {
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGTERM");
+          forceKillId = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              child.kill("SIGKILL");
+            }
+          }, options.killGraceMs ?? 1000);
+        }, timeoutMs);
+      }
     });
-    child.on("exit", (code) => resolve(code ?? 1));
-  });
-  clearInterval(poll);
-  await Promise.allSettled([...pendingStats]);
+    await Promise.allSettled([...pendingStats]);
 
-  const finalStats = await readProcessStats(child.pid);
-  recordStats(finalStats);
+    const finalStats = await readProcessStats(child.pid);
+    recordStats(finalStats);
 
-  const wallMs = Math.round(performance.now() - start);
-  const averageCpuPercent =
-    cpuSamples.length > 0
-      ? cpuSamples.reduce((sum, value) => sum + value, 0) / cpuSamples.length
-      : 0;
-  const cpuPercentForEstimate =
-    options.roundAverageCpuPercent === true
-      ? Math.round(averageCpuPercent * 10) / 10
-      : averageCpuPercent;
+    const wallMs = Math.round(performance.now() - start);
+    const averageCpuPercent =
+      cpuSamples.length > 0
+        ? cpuSamples.reduce((sum, value) => sum + value, 0) / cpuSamples.length
+        : 0;
+    const cpuPercentForEstimate =
+      options.roundAverageCpuPercent === true
+        ? Math.round(averageCpuPercent * 10) / 10
+        : averageCpuPercent;
 
+    return {
+      wallMs,
+      peakRssMb: Math.round((peakRssKb / 1024) * 10) / 10,
+      rssDeltaMb: Math.round(((peakRssKb - firstRssKb) / 1024) * 10) / 10,
+      peakCpuPercent: Math.round(peakCpuPercent * 10) / 10,
+      cpuMsEstimate: Math.round((wallMs * cpuPercentForEstimate) / 100),
+      harnessHeapDeltaMb: Math.round((heapUsedMb() - heapStartMb) * 10) / 10,
+      statSampleCount,
+      rssSampleCount,
+      cpuSampleCount,
+      exitCode,
+      timedOut,
+      pid: child.pid,
+      stdoutPreview: previewLines(stdout.chunks),
+      stderrPreview: previewLines(stderr.chunks),
+    };
+  } finally {
+    stopWatching();
+  }
+}
+
+export function resolveProfileTimeoutMs(options = {}) {
+  if (Number.isFinite(options.timeoutMs) && options.timeoutMs >= 0) {
+    return options.timeoutMs;
+  }
+  const fromEnv = Number.parseInt(String(options.env?.PLUGIN_INSPECTOR_PROFILE_TIMEOUT_MS ?? process.env.PLUGIN_INSPECTOR_PROFILE_TIMEOUT_MS ?? ""), 10);
+  if (Number.isFinite(fromEnv) && fromEnv >= 0) {
+    return fromEnv;
+  }
+  return defaultProfileTimeoutMs;
+}
+
+export function resolveProfileMaxOutputBytes(options = {}) {
+  if (Number.isFinite(options.maxOutputBytes) && options.maxOutputBytes >= 0) {
+    return options.maxOutputBytes;
+  }
+  return defaultProfileMaxOutputBytes;
+}
+
+function createCappedCollector(maxBytes) {
+  const chunks = [];
+  let size = 0;
   return {
-    wallMs,
-    peakRssMb: Math.round((peakRssKb / 1024) * 10) / 10,
-    rssDeltaMb: Math.round(((peakRssKb - firstRssKb) / 1024) * 10) / 10,
-    peakCpuPercent: Math.round(peakCpuPercent * 10) / 10,
-    cpuMsEstimate: Math.round((wallMs * cpuPercentForEstimate) / 100),
-    harnessHeapDeltaMb: Math.round((heapUsedMb() - heapStartMb) * 10) / 10,
-    statSampleCount,
-    rssSampleCount,
-    cpuSampleCount,
-    exitCode,
-    stdoutPreview: previewLines(stdout),
-    stderrPreview: previewLines(stderr),
+    chunks,
+    push(chunk) {
+      if (size >= maxBytes) {
+        return;
+      }
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const room = maxBytes - size;
+      chunks.push(buffer.length > room ? buffer.subarray(0, room) : buffer);
+      size += Math.min(buffer.length, room);
+    },
   };
 }
 

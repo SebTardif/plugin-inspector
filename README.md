@@ -250,6 +250,17 @@ Capture one entrypoint directly:
 plugin-inspector capture ./dist/index.js --mock-sdk --allow-execute
 ```
 
+Mock-SDK capture runs the plugin in a child process. If `register()` never
+settles, or the child never exits, the inspector kills that child after 30
+seconds and reports a `capture-timeout` failure instead of hanging. Override
+the budget with `timeoutMs` or `PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS`.
+
+Import-loop and runtime profiles use the same 30-second child budget so a
+command that never exits cannot stall `buildImportLoopProfile` or
+`buildRuntimeProfile`. Override those with `timeoutMs` or
+`PLUGIN_INSPECTOR_PROFILE_TIMEOUT_MS`. Profiled stdout and stderr are capped
+at 1 MB.
+
 ## CI
 
 `plugin-inspector ci` writes the normal compatibility report plus CI-native

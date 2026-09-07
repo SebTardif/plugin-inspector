@@ -7,6 +7,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createCaptureApi } from "./capture-api.js";
 import { captureApiOptionsForPlugin } from "./capture-config.js";
+import { flushWrite } from "./flush-write.js";
 import { createMockSdkPackage } from "./sdk-mock.js";
 
 const options = JSON.parse(process.argv[2] ?? "{}");
@@ -14,13 +15,14 @@ let activeOutputCapture = null;
 
 try {
   const result = await run(options);
-  writeRunnerStdout(`${JSON.stringify(result, null, 2)}\n`);
+  await writeRunnerStdout(`${JSON.stringify(result, null, 2)}\n`);
+  process.exit(0);
 } catch (error) {
   if (error.failureClass) {
-    writeRunnerStderr(`[plugin-inspector:${error.failureClass}]\n`);
+    await writeRunnerStderr(`[plugin-inspector:${error.failureClass}]\n`);
   }
-  writeRunnerStderr(`${error.stack ?? error.message}\n`);
-  process.exitCode = 1;
+  await writeRunnerStderr(`${error.stack ?? error.message}\n`);
+  process.exit(1);
 }
 
 async function run(options) {
@@ -162,9 +164,11 @@ async function drainAsyncOutput() {
 }
 
 function writeRunnerStdout(text) {
-  (activeOutputCapture?.originalStdoutWrite ?? process.stdout.write.bind(process.stdout))(text);
+  const write = activeOutputCapture?.originalStdoutWrite ?? process.stdout.write.bind(process.stdout);
+  return flushWrite(write, text);
 }
 
 function writeRunnerStderr(text) {
-  (activeOutputCapture?.originalStderrWrite ?? process.stderr.write.bind(process.stderr))(text);
+  const write = activeOutputCapture?.originalStderrWrite ?? process.stderr.write.bind(process.stderr);
+  return flushWrite(write, text);
 }

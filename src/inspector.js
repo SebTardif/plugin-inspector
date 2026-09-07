@@ -1,10 +1,9 @@
 import { existsSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import * as nodeModule from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 import { createCaptureApi } from "./capture-api.js";
 import { captureApiOptionsForPlugin } from "./capture-config.js";
 import { fixtureCheckoutPath, fixtureSourceRoot } from "./config.js";
@@ -14,10 +13,11 @@ import { prepareOpenClawTarget, resolveOpenClawTargetVersion } from "./openclaw-
 import { buildCompatibilityReport, buildReport } from "./report.js";
 import { inspectSdkDeprecations } from "./sdk-deprecation-rules.js";
 
-const execFileAsync = promisify(execFile);
 const pluginFactoryNames = "defineBundledChannelEntry|defineChannelPluginEntry|createChatChannelPlugin|definePluginEntry";
 // Bundlers emit unbound calls as (0, sdk.factory)(...), including inline require receivers.
 const compiledFactoryCall = new RegExp(String.raw`\(\s*0\s*,\s*(?:require\s*\(\s*(?:"[^"\r\n]*"|'[^'\r\n]*')\s*\)|[$A-Z_a-z][$\w]*)(?:\s*\.\s*[$A-Z_a-z][$\w]*)*\s*\.\s*(${pluginFactoryNames})\s*\)\s*\(`, "dg");
+export const defaultCaptureTimeoutMs = 30_000;
+export const defaultCaptureKillGraceMs = 1_000;
 const registrationEquivalents = new Map([
   ["registerChannel", new Set(["createChatChannelPlugin", "defineBundledChannelEntry", "defineChannelPluginEntry", "registerChannel"])],
 ]);
@@ -233,27 +233,146 @@ export async function captureEntrypointWithMockSdk(entrypoint, options = {}) {
     pluginRoot: options.pluginRoot,
     apiOptions: options.apiOptions,
   };
+  const timeoutMs = resolveCaptureTimeoutMs(options);
+  const killGraceMs = resolveCaptureKillGraceMs(options);
   try {
-    const { stdout } = await execFileAsync(
-      process.execPath,
-      ["--no-warnings", "--preserve-symlinks", runnerPath, JSON.stringify(payload)],
-      {
-        cwd: options.cwd ?? process.cwd(),
-        env: {
-          ...process.env,
-          ...(options.env ?? {}),
-        },
-        maxBuffer: 1024 * 1024 * 10,
+    const { stdout } = await runMockSdkCaptureChild({
+      runnerPath,
+      payload,
+      cwd: options.cwd ?? process.cwd(),
+      env: {
+        ...process.env,
+        ...(options.env ?? {}),
       },
-    );
+      timeoutMs,
+      killGraceMs,
+      maxBuffer: 1024 * 1024 * 10,
+    });
     return JSON.parse(stdout);
   } catch (error) {
+    error.timeoutMs = timeoutMs;
     const captured = parseCaptureResultFromStdout(error?.stdout);
-    if (captured) {
+    if (captured && !isChildTimeoutError(error)) {
       return captured;
     }
     throw classifyMockSdkCaptureError(error);
   }
+}
+
+export function resolveCaptureTimeoutMs(options = {}) {
+  if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+    return options.timeoutMs;
+  }
+  const fromEnv = Number.parseInt(String(options.env?.PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS ?? process.env.PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS ?? ""), 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  return defaultCaptureTimeoutMs;
+}
+
+export function resolveCaptureKillGraceMs(options = {}) {
+  if (Number.isFinite(options.killGraceMs) && options.killGraceMs >= 0) {
+    return options.killGraceMs;
+  }
+  const fromEnv = Number.parseInt(
+    String(options.env?.PLUGIN_INSPECTOR_CAPTURE_KILL_GRACE_MS ?? process.env.PLUGIN_INSPECTOR_CAPTURE_KILL_GRACE_MS ?? ""),
+    10,
+  );
+  if (Number.isFinite(fromEnv) && fromEnv >= 0) {
+    return fromEnv;
+  }
+  return defaultCaptureKillGraceMs;
+}
+
+function runMockSdkCaptureChild({ runnerPath, payload, cwd, env, timeoutMs, killGraceMs, maxBuffer }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ["--no-warnings", "--preserve-symlinks", runnerPath, JSON.stringify(payload)],
+      { cwd, env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutBytes = 0;
+    let settled = false;
+    let timedOut = false;
+    let timeoutId;
+    let forceKillId;
+
+    const finish = (err, result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+      }
+      if (forceKillId !== undefined) {
+        clearTimeout(forceKillId);
+      }
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(result);
+    };
+
+    child.stdout?.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes <= maxBuffer) {
+        stdoutChunks.push(chunk);
+      }
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderrChunks.push(chunk);
+    });
+    child.on("error", (error) => finish(error));
+    child.on("exit", (code, signal) => {
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (timedOut) {
+        finish(
+          Object.assign(new Error("Command failed: node mock-sdk-capture-runner.js"), {
+            killed: true,
+            signal: signal ?? "SIGKILL",
+            code,
+            stdout,
+            stderr,
+          }),
+        );
+        return;
+      }
+      if (code === 0) {
+        finish(null, { stdout, stderr });
+        return;
+      }
+      finish(
+        Object.assign(new Error("Command failed: node mock-sdk-capture-runner.js"), {
+          killed: false,
+          signal,
+          code,
+          stdout,
+          stderr,
+        }),
+      );
+    });
+
+    if (timeoutMs > 0) {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+        forceKillId = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill("SIGKILL");
+          }
+        }, killGraceMs);
+      }, timeoutMs);
+    }
+  });
+}
+
+export function isChildTimeoutError(error) {
+  return error?.killed === true && (error.signal === "SIGTERM" || error.signal === "SIGKILL");
 }
 
 function parseCaptureResultFromStdout(stdout) {
@@ -277,6 +396,14 @@ function parseCaptureResultFromStdout(stdout) {
 }
 
 export function classifyMockSdkCaptureError(error) {
+  if (isChildTimeoutError(error)) {
+    const timeoutMs = Number.isFinite(error?.timeoutMs) ? error.timeoutMs : defaultCaptureTimeoutMs;
+    return enrichCaptureError(error, {
+      message: `Mock SDK capture timed out after ${timeoutMs}ms`,
+      failureClass: "capture-timeout",
+    });
+  }
+
   const rawMessage = [error?.stderr, error?.stdout, error?.message].filter(Boolean).join("\n");
   const missingExport = rawMessage.match(/does not provide an export named ['"]([^'"]+)['"]/)?.[1];
   if (missingExport) {

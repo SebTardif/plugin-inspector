@@ -261,12 +261,16 @@ async function runCaptureSample(options) {
     args: command.args,
     cwd: command.cwd ?? options.rootDir,
     env: { ...process.env, ...command.env },
+    timeoutMs: options.timeoutMs,
+    maxOutputBytes: options.maxOutputBytes,
+    killGraceMs: options.killGraceMs,
   });
   const output = profile.exitCode === 0 ? await readCaptureOutput(outputPath) : null;
 
   return {
     index: options.index,
     exitCode: profile.exitCode,
+    timedOut: profile.timedOut === true,
     status: output?.status ?? "failed",
     capturedCount: output?.captured?.length ?? 0,
     openClawLifecycle: output?.openClawLifecycle ?? null,
