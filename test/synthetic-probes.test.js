@@ -388,6 +388,45 @@ test("synthetic probes keep opt-in registrations guarded", async () => {
   assert.equal(executed.results[0].label, "registerService.start");
 });
 
+test("synthetic probes finish registerService start before stop and dispose", async () => {
+  const capture = await captureLocalFixture([
+    "let startFinished = false;",
+    "let stopFinished = false;",
+    "export function register(api) {",
+    "  api.registerService({",
+    "    name: 'fixture_service',",
+    "    async start() {",
+    "      await new Promise((resolve) => setImmediate(resolve));",
+    "      startFinished = true;",
+    "      return { started: true };",
+    "    },",
+    "    stop() {",
+    "      if (!startFinished) throw new Error('stop ran before start finished');",
+    "      stopFinished = true;",
+    "      return { stopped: true };",
+    "    },",
+    "    dispose() {",
+    "      if (!startFinished) throw new Error('dispose ran before start finished');",
+    "      if (!stopFinished) throw new Error('dispose ran before stop finished');",
+    "      return { disposed: true };",
+    "    },",
+    "  });",
+    "}",
+  ]);
+
+  const result = await runCapturedSyntheticProbes(capture, { includeLifecycle: true });
+
+  assert.equal(result.summary.failCount, 0);
+  assert.deepEqual(
+    result.results.map((item) => `${item.status}:${item.label}`),
+    [
+      "pass:registerService.start",
+      "pass:registerService.stop",
+      "pass:registerService.dispose",
+    ],
+  );
+});
+
 test("mock SDK capture preserves retained registration metadata across subprocesses", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-probes-mock-sdk-"));
   const entrypoint = path.join(dir, "fixture.mjs");

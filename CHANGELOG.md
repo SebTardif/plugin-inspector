@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Run `registerService` start, stop, and dispose probes serially so teardown cannot overlap startup.
+
 - Capture plugins that bind `api.runtime.modelAuth` during registration with credential-free defaults; auth acquisition remains an explicit synthetic failure.
 
 ## 0.3.24 - 2026-08-31
