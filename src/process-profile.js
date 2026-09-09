@@ -223,7 +223,7 @@ export function resolveProcessLimits(options, kind = "PROFILE") {
   return {
     timeoutMs: positiveLimit(options.timeoutMs, setting("TIMEOUT_MS"), defaultTimeoutMs),
     killGraceMs: positiveLimit(options.killGraceMs, setting("KILL_GRACE_MS"), defaultKillGraceMs, 30_000),
-    maxOutputBytes: positiveLimit(options.maxOutputBytes, setting("MAX_OUTPUT_BYTES"), (kind === "CAPTURE" ? 10 : 1) * 1024 * 1024),
+    maxOutputBytes: positiveLimit(options.maxOutputBytes, setting("MAX_OUTPUT_BYTES"), (kind === "CAPTURE" || kind === "PROBE" ? 10 : 1) * 1024 * 1024),
   };
 }
 

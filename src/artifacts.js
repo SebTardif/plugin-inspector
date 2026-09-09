@@ -1,5 +1,26 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+
+export async function readBoundedJsonArtifact(filePath, maxBytes) {
+  const file = await open(filePath, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile()) throw new Error("expected a regular result file");
+    if (stat.size > maxBytes) throw new Error("result exceeded its byte limit");
+    const chunks = [];
+    let bytes = 0;
+    // end is inclusive: read at most limit + 1 even if the file grew after stat.
+    for await (const chunk of file.createReadStream({ end: maxBytes, autoClose: false })) {
+      chunks.push(chunk);
+      bytes += chunk.length;
+    }
+    if (bytes > maxBytes) throw new Error("result exceeded its byte limit");
+    return JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
+  } finally {
+    await file.close();
+  }
+}
 
 export async function writeArtifacts(artifacts, options = {}) {
   if (!Array.isArray(artifacts) || artifacts.length === 0) {

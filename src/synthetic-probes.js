@@ -1,4 +1,5 @@
 import { renderPaddedMarkdownTable, writeJsonMarkdownArtifacts } from "./artifacts.js";
+import { resolveProcessLimits } from "./process-profile.js";
 
 export const syntheticRegistrationExecutionProfiles = {
   createChatChannelPlugin: {
@@ -622,8 +623,27 @@ export async function writeSyntheticProbePlan(plan, options = {}) {
 }
 
 export async function runCapturedSyntheticProbes(capture, options = {}) {
+  options.signal?.throwIfAborted();
   const hookEvents = options.hookEvents ?? defaultSyntheticHookEvents;
   const hookContexts = options.hookContexts ?? defaultSyntheticHookContexts;
+  const { timeoutMs } = resolveProcessLimits(options, "PROBE");
+  const controller = new AbortController();
+  const onCancel = () => controller.abort(new Error("Synthetic probes cancelled"));
+  options.signal?.addEventListener("abort", onCancel, { once: true });
+  if (options.signal?.aborted) onCancel();
+  try {
+    const result = await runCapturedProbes(capture, {
+      ...options, hookEvents, hookContexts, timeoutMs, controller, signal: controller.signal,
+    });
+    if (options.signal?.aborted) throw controller.signal.reason;
+    return result;
+  } finally {
+    options.signal?.removeEventListener("abort", onCancel);
+  }
+}
+
+async function runCapturedProbes(capture, options) {
+  const { hookEvents, hookContexts, timeoutMs, controller, signal } = options;
   const captured = capture.captured ?? [];
   const retained = new Map((capture.retained ?? []).map((item) => [item.captureIndex, item]));
   const resultsByCaptureIndex = new Map();
@@ -636,6 +656,10 @@ export async function runCapturedSyntheticProbes(capture, options = {}) {
     );
 
   for (const { entry, captureIndex } of executionEntries) {
+    if (signal.aborted) {
+      resultsByCaptureIndex.set(captureIndex, [blockedResult(entry, captureIndex, signal.reason.message)]);
+      continue;
+    }
     const retainedEntry = retained.get(captureIndex);
     if (!retainedEntry) {
       resultsByCaptureIndex.set(captureIndex, [blockedResult(entry, captureIndex, "handler retention was not enabled")]);
@@ -643,7 +667,7 @@ export async function runCapturedSyntheticProbes(capture, options = {}) {
     }
     if (entry.kind === "hook") {
       resultsByCaptureIndex.set(captureIndex, [
-        await runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, hookContexts }),
+        await runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, hookContexts, timeoutMs, controller }),
       ]);
       continue;
     }
@@ -744,7 +768,7 @@ function probeBlocker({ hasSyntheticArguments, execution }) {
   return null;
 }
 
-async function runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, hookContexts }) {
+async function runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, hookContexts, timeoutMs, controller }) {
   if (typeof retainedEntry.handler !== "function") {
     return blockedResult(entry, captureIndex, "captured hook has no callable handler");
   }
@@ -753,6 +777,8 @@ async function runHookProbe(entry, retainedEntry, captureIndex, { hookEvents, ho
     kind: "hook",
     seam: entry.name,
     label: entry.name,
+    timeoutMs,
+    controller,
     invoke: () =>
       retainedEntry.handler(
         hookEvents[entry.name] ?? { hook: entry.name },
@@ -787,12 +813,21 @@ async function runRegistrationProbes(entry, retainedEntry, captureIndex, options
   // The profile owns lifecycle order; finish each callback before starting the next.
   const results = [];
   for (const invocation of invocations) {
+    if (options.signal.aborted) {
+      results.push({
+        ...blockedResult(entry, captureIndex, options.signal.reason.message),
+        label: invocation.label,
+      });
+      continue;
+    }
     results.push(
       await runProbe({
         captureIndex,
         kind: "registration",
         seam: entry.name,
         label: invocation.label,
+        timeoutMs: options.timeoutMs,
+        controller: options.controller,
         invoke: invocation.invoke,
       }),
     );
@@ -850,21 +885,21 @@ function syntheticRegistrationEvent(registrar, property, options) {
   };
 }
 
-function toolRunProbeArgs(event) {
+function toolRunProbeArgs(event, options = {}) {
   return [
     event.params,
     {
       source: event.source,
       toolName: event.toolName,
       toolCallId: event.toolCall.id,
-      signal: new AbortController().signal,
+      signal: options.signal ?? new AbortController().signal,
       logger: console,
     },
   ];
 }
 
-function toolExecuteProbeArgs(event) {
-  return [event.toolCall.id, event.params, new AbortController().signal, () => undefined];
+function toolExecuteProbeArgs(event, options = {}) {
+  return [event.toolCall.id, event.params, options.signal ?? new AbortController().signal, () => undefined];
 }
 
 function httpRouteProbeArgs(event) {
@@ -886,12 +921,12 @@ function httpRouteProbeArgs(event) {
   ];
 }
 
-function commandProbeArgs(event) {
+function commandProbeArgs(event, options = {}) {
   return [
     event.input,
     {
       source: event.source,
-      signal: new AbortController().signal,
+      signal: options.signal ?? new AbortController().signal,
       logger: console,
     },
   ];
@@ -913,7 +948,7 @@ function gatewayProbeArgs(event) {
   ];
 }
 
-function channelSendProbeArgs(event) {
+function channelSendProbeArgs(event, options = {}) {
   return [
     {
       source: event.source,
@@ -924,12 +959,12 @@ function channelSendProbeArgs(event) {
       replyToId: "fixture-reply",
       threadId: "fixture-thread",
       logger: console,
-      signal: new AbortController().signal,
+      signal: options.signal ?? new AbortController().signal,
     },
   ];
 }
 
-function channelReceiveProbeArgs(event) {
+function channelReceiveProbeArgs(event, options = {}) {
   return [
     {
       source: event.source,
@@ -949,7 +984,7 @@ function channelReceiveProbeArgs(event) {
         to: "fixture-channel",
       },
       logger: console,
-      signal: new AbortController().signal,
+      signal: options.signal ?? new AbortController().signal,
     },
   ];
 }
@@ -967,7 +1002,7 @@ function interactiveProbeArgs(event) {
   ];
 }
 
-function lifecycleProbeArgs(event) {
+function lifecycleProbeArgs(event, options = {}) {
   return [
     {
       source: event.source,
@@ -975,7 +1010,7 @@ function lifecycleProbeArgs(event) {
       logger: console,
       runtime: { env: {}, logger: console },
       secrets: { get: async () => null, has: async () => false },
-      signal: new AbortController().signal,
+      signal: options.signal ?? new AbortController().signal,
     },
   ];
 }
@@ -993,9 +1028,9 @@ function speechProbeArgs(event) {
   ];
 }
 
-async function runProbe({ captureIndex, kind, seam, label, invoke }) {
+async function runProbe({ captureIndex, kind, seam, label, invoke, timeoutMs, controller }) {
   try {
-    const output = await invoke();
+    const output = await invokeWithTimeout(invoke, timeoutMs, controller);
     return {
       captureIndex,
       kind,
@@ -1014,6 +1049,30 @@ async function runProbe({ captureIndex, kind, seam, label, invoke }) {
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+function invokeWithTimeout(invoke, timeoutMs, controller) {
+  const { signal } = controller;
+  let rejectAborted;
+  const aborted = new Promise((_, reject) => { rejectAborted = reject; });
+  const onAbort = () => rejectAborted(signal.reason);
+  signal.addEventListener("abort", onAbort, { once: true });
+  const timeoutId = setTimeout(() => {
+    controller.abort(new Error(`Synthetic probe timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  // Keep observing settlement after abort without starting dependent callbacks.
+  // In-process JavaScript itself is not preempted by this deadline.
+  const result = Promise.resolve().then(() => {
+    signal.throwIfAborted();
+    return invoke();
+  }).then((output) => {
+    signal.throwIfAborted();
+    return output;
+  });
+  return Promise.race([result, aborted]).finally(() => {
+    clearTimeout(timeoutId);
+    signal.removeEventListener("abort", onAbort);
+  });
 }
 
 function blockedResult(entry, captureIndex, reason) {

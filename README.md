@@ -321,6 +321,37 @@ These limits apply to owned child processes only. The public in-process
 `captureEntrypoint` path preserves retained handler identity and does not
 claim to cancel synchronous plugin code or retained callbacks.
 
+Synthetic probe APIs give each invoked callback a 30-second default budget.
+Set `timeoutMs` or `PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS`; the same finite positive
+API-then-environment validation applies, with no zero or infinite opt-out.
+A timed-out callback becomes a failed row and remaining dependent probes are
+blocked. Ordinary handler failures remain failed rows without stopping
+independent probes. Caller `signal` cancellation rejects the API call.
+Timeout and cancellation abort supported handler signal arguments and observe
+late promise settlement, but cannot preempt synchronous JavaScript or arbitrary
+plugin side effects. Programmatic probes stay in-process and preserve caller
+runtime objects and retained callback identity.
+
+`synthetic-probes-cli.js` runs capture and retained callbacks together in one
+owned child. Its whole-child budget also defaults to 30 seconds, including
+imports and registration, with `PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS`,
+`PLUGIN_INSPECTOR_PROBE_KILL_GRACE_MS`, and
+`PLUGIN_INSPECTOR_PROBE_MAX_OUTPUT_BYTES` overrides. Shutdown uses the same
+bounded grace and process-group cleanup as capture. The default report and
+per-pipe limit is 10 MiB, matching capture; intercepted plugin stdout and stderr are each capped
+at 1 MiB and kept separate from the report protocol.
+
+Completed synthetic reports are still written even when they contain failed
+probe rows; the CLI exits successfully after delivering them, and CI policy
+evaluates those rows. Child timeout, cancellation, truncated output, or an
+oversized or malformed report instead exits unsuccessfully without writing a
+new output artifact. The CLI validates the report shape, row identities and
+statuses, and summary counts before publication; valid empty and blocked
+reports are preserved. This is protocol validation, not authenticated
+completion or a security sandbox: same-process plugin code can still fabricate
+a valid report. Healthy retained intervals cannot keep the child alive after
+its complete report is flushed.
+
 ## CI
 
 `plugin-inspector ci` writes the normal compatibility report plus CI-native

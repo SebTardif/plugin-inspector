@@ -1,8 +1,7 @@
-import { constants } from "node:fs";
-import { mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { renderPaddedMarkdownTable, writeJsonMarkdownArtifacts } from "./artifacts.js";
+import { readBoundedJsonArtifact, renderPaddedMarkdownTable, writeJsonMarkdownArtifacts } from "./artifacts.js";
 import { resolveFromRoot } from "./path-utils.js";
 import { resolveProcessLimits, runProfiledProcess } from "./process-profile.js";
 import { assertRunCount, percentile } from "./stats.js";
@@ -457,27 +456,11 @@ function buildCaptureCommand(options) {
 
 async function readCaptureOutput(outputPath, maxOutputBytes) {
   if (maxOutputBytes === undefined) return JSON.parse(await readFile(outputPath, "utf8"));
-  const file = await open(outputPath, constants.O_RDONLY | constants.O_NONBLOCK);
-  try {
-    const stat = await file.stat();
-    if (!stat.isFile()) throw new Error("expected a regular capture file");
-    if (stat.size > maxOutputBytes) throw new Error("capture result exceeded its byte limit");
-    const chunks = [];
-    let bytes = 0;
-    // end is inclusive: read at most limit + 1 even if the file grew after stat.
-    for await (const chunk of file.createReadStream({ end: maxOutputBytes, autoClose: false })) {
-      chunks.push(chunk);
-      bytes += chunk.length;
-    }
-    if (bytes > maxOutputBytes) throw new Error("capture result exceeded its byte limit");
-    const result = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
-    if (!result || typeof result.status !== "string" || !Array.isArray(result.captured)) {
-      throw new Error("expected a capture status and captured contracts");
-    }
-    return result;
-  } finally {
-    await file.close();
+  const result = await readBoundedJsonArtifact(outputPath, maxOutputBytes);
+  if (!result || typeof result.status !== "string" || !Array.isArray(result.captured)) {
+    throw new Error("expected a capture status and captured contracts");
   }
+  return result;
 }
 
 function markdownTable(rows, headers) {

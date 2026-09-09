@@ -16,9 +16,10 @@ let activeOutputCapture = null;
 try {
   const result = await run(options);
   const json = `${JSON.stringify(result, null, 2)}\n`;
-  const { maxOutputBytes } = resolveProcessLimits(options, "CAPTURE");
+  const { maxOutputBytes } = resolveProcessLimits(options, options.syntheticProbes ? "PROBE" : "CAPTURE");
   if (Buffer.byteLength(json) > maxOutputBytes) {
-    throw new Error(`${options.mockSdk === false ? "Real SDK" : "Mock SDK"} capture result exceeded its ${maxOutputBytes}-byte limit`);
+    const label = options.syntheticProbes ? "Synthetic probe" : `${options.mockSdk === false ? "Real SDK" : "Mock SDK"} capture`;
+    throw new Error(`${label} result exceeded its ${maxOutputBytes}-byte limit`);
   }
   if (options.outputPath) {
     await writeArtifacts([{ path: options.outputPath, content: json }]);
@@ -73,7 +74,7 @@ async function captureLinkedEntrypoint(entrypoint, options) {
 
   if (!register) {
     await drainAsyncOutput();
-    return withProcessOutput(
+    return finishCapture(
       {
         status: "no-register-export",
         entrypoint: options.mockSdk === false ? entrypoint : options.entrypoint,
@@ -81,6 +82,7 @@ async function captureLinkedEntrypoint(entrypoint, options) {
         captured: [],
       },
       outputCapture,
+      options,
     );
   }
 
@@ -104,6 +106,15 @@ async function captureLinkedEntrypoint(entrypoint, options) {
   };
   if (apiOptions?.retainHandlers === true) {
     result.retained = api.getRetainedContracts();
+  }
+  return finishCapture(result, outputCapture, options);
+}
+
+async function finishCapture(result, outputCapture, options) {
+  if (options.syntheticProbes) {
+    const { runCapturedSyntheticProbes } = await import("./synthetic-probes.js");
+    result = await runCapturedSyntheticProbes(result, options);
+    await drainAsyncOutput();
   }
   return withProcessOutput(result, outputCapture);
 }

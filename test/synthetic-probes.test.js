@@ -3,6 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   buildSyntheticProbePlan,
   captureEntrypoint,
@@ -444,6 +445,147 @@ test("synthetic probes keep opt-in registrations guarded", async () => {
   assert.equal(executed.results[0].label, "registerService.start");
 });
 
+test("synthetic probes fail a hanging invoke instead of waiting forever", { timeout: 2000 }, async () => {
+  const capture = await captureLocalFixture([
+    "export function register(api) {",
+    "  api.on('before_tool_call', () => new Promise(() => {}));",
+    "}",
+  ]);
+
+  const result = await runCapturedSyntheticProbes(capture, { timeoutMs: 50 });
+
+  assert.equal(result.summary.failCount, 1);
+  assert.equal(result.results[0].status, "fail");
+  assert.equal(result.results[0].label, "before_tool_call");
+  assert.match(result.results[0].error, /timed out after 50ms/);
+});
+
+test("synthetic probe budgets use valid API then environment values", { timeout: 3000 }, async (t) => {
+  const capture = captureRetained((api) => api.on("before_tool_call", () => new Promise(() => {})));
+  for (const timeoutMs of [25, 0, -1, NaN, Infinity, 2 ** 31]) {
+    await t.test(String(timeoutMs), async () => {
+      const expected = timeoutMs === 25 ? 25 : 40;
+      const result = await runCapturedSyntheticProbes(capture, {
+        timeoutMs, env: { PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS: "40" },
+      });
+      assert.equal(result.summary.failCount, 1);
+      assert.equal(result.results[0].error, `Synthetic probe timed out after ${expected}ms`);
+    });
+  }
+});
+
+test("synthetic probe default stays finite after invalid environment values", { timeout: 3000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const value of ["invalid", "0", "Infinity", "2147483648", "25ms"]) {
+    let started;
+    const invoked = new Promise((resolve) => { started = resolve; });
+    const capture = captureRetained((api) => api.on("before_tool_call", () => {
+      started();
+      return new Promise(() => {});
+    }));
+    const pending = runCapturedSyntheticProbes(capture, { env: { PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS: value } });
+    await invoked;
+    t.mock.timers.tick(30_000);
+    const result = await pending;
+    assert.equal(result.results[0].error, "Synthetic probe timed out after 30000ms", value);
+  }
+});
+
+test("synthetic probe timeout aborts supported input and blocks dependent work", { timeout: 3000 }, async () => {
+  const calls = [];
+  let signal;
+  const capture = captureRetained((api) => {
+    api.registerService({
+      name: "fixture",
+      start(ctx) {
+        signal = ctx.signal;
+        calls.push("start");
+        return new Promise((_, reject) => {
+          signal.addEventListener("abort", () => {
+            calls.push("abort");
+            reject(signal.reason);
+          }, { once: true });
+        });
+      },
+      stop() { calls.push("stop"); },
+      dispose() { calls.push("dispose"); },
+    });
+    api.on("before_tool_call", () => { calls.push("later"); });
+  });
+  const result = await runCapturedSyntheticProbes(capture, { includeLifecycle: true, timeoutMs: 25 });
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(calls, ["start", "abort"]);
+  assert.deepEqual(result.results.map((row) => [row.label, row.status]), [
+    ["registerService.start", "fail"],
+    ["registerService.stop", "blocked"],
+    ["registerService.dispose", "blocked"],
+    ["before_tool_call", "blocked"],
+  ]);
+});
+
+test("synthetic probe cancellation rejects and prevents later callbacks", { timeout: 3000 }, async () => {
+  let started;
+  const invoked = new Promise((resolve) => { started = resolve; });
+  let later = 0;
+  let receivedSignal;
+  const capture = captureRetained((api) => {
+    api.registerTool({
+      name: "fixture",
+      execute(_id, _params, signal) {
+        receivedSignal = signal;
+        started();
+        return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      },
+    });
+    api.on("before_tool_call", () => { later += 1; });
+  });
+  const controller = new AbortController();
+  const pending = runCapturedSyntheticProbes(capture, { signal: controller.signal, timeoutMs: 100 });
+  const rejected = assert.rejects(pending, /cancelled/);
+  await invoked;
+  controller.abort();
+  await rejected;
+  assert.equal(receivedSignal.aborted, true);
+  assert.equal(later, 0);
+});
+
+test("already cancelled synthetic probes do not invoke plugin code", async () => {
+  let calls = 0;
+  const capture = captureRetained((api) => api.on("before_tool_call", () => { calls += 1; }));
+  await assert.rejects(runCapturedSyntheticProbes(capture, { signal: AbortSignal.abort() }));
+  assert.equal(calls, 0);
+});
+
+test("synthetic probes observe late rejection without starting later work", { timeout: 3000 }, async () => {
+  let later = 0;
+  const capture = captureRetained((api) => {
+    api.on("before_tool_call", () => new Promise((_, reject) => setTimeout(() => reject(new Error("late failure")), 75)));
+    api.registerCommand({ name: "later", handler() { later += 1; } });
+  });
+  const result = await runCapturedSyntheticProbes(capture, { timeoutMs: 25 });
+  await delay(100);
+  assert.equal(result.summary.failCount, 1);
+  assert.equal(result.results[1].status, "blocked");
+  assert.equal(later, 0);
+});
+
+test("synthetic entrypoint API preserves supplied runtime and retained callback identity", async () => {
+  const event = { toolName: "identity-fixture" };
+  let calls = 0;
+  const handler = (actual) => { assert.equal(actual, event); calls += 1; return "identity-ok"; };
+  const runtime = { handler };
+  const capture = await captureLocalFixture([
+    "export function register(api) { api.on('before_tool_call', api.runtime.handler); }",
+  ], { apiOptions: { runtime } });
+  assert.equal(capture.retained[0].handler, handler);
+  const result = await runEntrypointSyntheticProbes(capture.entrypoint, {
+    apiOptions: { runtime }, hookEvents: { before_tool_call: event },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.results[0].output.value, "identity-ok");
+  assert.deepEqual(Object.keys(runtime), ["handler"]);
+});
+
 test("synthetic probes finish registerService start before stop and dispose", async () => {
   const capture = await captureLocalFixture([
     "let startFinished = false;",
@@ -686,11 +828,18 @@ for (const mockSdk of [false, true]) {
   });
 }
 
-async function captureLocalFixture(lines) {
+function captureRetained(register) {
+  const api = createCaptureApi({ retainHandlers: true });
+  register(api);
+  return { status: "captured", captured: api.getCapturedContracts(), retained: api.getRetainedContracts() };
+}
+
+async function captureLocalFixture(lines, options = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-probes-"));
   const entrypoint = path.join(dir, "fixture.mjs");
   await writeFile(entrypoint, `${lines.join("\n")}\n`, "utf8");
   return captureEntrypoint(entrypoint, {
-    apiOptions: { retainHandlers: true },
+    ...options,
+    apiOptions: { ...options.apiOptions, retainHandlers: true },
   });
 }
