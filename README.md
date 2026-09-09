@@ -344,9 +344,13 @@ at 1 MiB and kept separate from the report protocol.
 Completed synthetic reports are still written even when they contain failed
 probe rows; the CLI exits successfully after delivering them, and CI policy
 evaluates those rows. Child timeout, cancellation, truncated output, or an
-oversized report instead exits unsuccessfully without writing a new output
-artifact. Healthy retained intervals cannot keep the child alive after its
-complete report is flushed.
+oversized or malformed report instead exits unsuccessfully without writing a
+new output artifact. The CLI validates the report shape, row identities and
+statuses, and summary counts before publication; valid empty and blocked
+reports are preserved. This is protocol validation, not authenticated
+completion or a security sandbox: same-process plugin code can still fabricate
+a valid report. Healthy retained intervals cannot keep the child alive after
+its complete report is flushed.
 
 ## CI
 

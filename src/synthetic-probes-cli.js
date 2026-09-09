@@ -84,12 +84,39 @@ async function runInChild(entrypoint, options) {
     // The report is separate from plugin stdout, including direct fd writes.
     // Only accept a fresh complete artifact after successful child cleanup.
     const results = await readBoundedJsonArtifact(outputPath, limits.maxOutputBytes);
+    validateSyntheticReport(results);
     controller.signal.throwIfAborted();
     return results;
   } finally {
     process.removeListener("SIGINT", cancel);
     process.removeListener("SIGTERM", cancel);
     await rm(workspace, { recursive: true, force: true });
+  }
+}
+
+function validateSyntheticReport(report) {
+  const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!isObject(report) || typeof report.entrypoint !== "string" ||
+      !["captured", "no-register-export"].includes(report.status) ||
+      !isObject(report.summary) || !Array.isArray(report.results)) {
+    throw new Error("Invalid synthetic probe report: expected entrypoint, status, summary, and results");
+  }
+  const counts = { probeCount: report.results.length, passCount: 0, failCount: 0, blockedCount: 0 };
+  for (const row of report.results) {
+    if (!isObject(row) || !Number.isSafeInteger(row.captureIndex) || row.captureIndex < 0 ||
+        !["kind", "seam", "label"].every((key) => typeof row[key] === "string") ||
+        !["pass", "fail", "blocked"].includes(row.status) ||
+        (row.status === "fail" && typeof row.error !== "string") ||
+        (row.status === "blocked" && typeof row.reason !== "string")) {
+      throw new Error("Invalid synthetic probe report: malformed result row");
+    }
+    counts[`${row.status}Count`] += 1;
+  }
+  for (const [key, expected] of Object.entries(counts)) {
+    if (!Number.isSafeInteger(report.summary[key]) || report.summary[key] < 0 ||
+        report.summary[key] !== expected) {
+      throw new Error(`Invalid synthetic probe report: invalid or inconsistent ${key}`);
+    }
   }
 }
 

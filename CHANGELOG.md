@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Bound synthetic callback waits and cancellation, stop dependent probes after a timeout, and supervise CLI capture plus retained callbacks in one child. Preserve complete failed-row reports, bounded plugin output, and in-process callback identity. Thanks @SebTardif.
+- Bound synthetic callback waits and cancellation, stop dependent probes after a timeout, and supervise CLI capture plus retained callbacks in one child. Validate report shape and counts before delivery while preserving complete failed-row reports, bounded plugin output, and in-process callback identity. Thanks @SebTardif.
 - Run `registerService` start, stop, and dispose probes serially so teardown cannot overlap startup.
 - Bound real-SDK CLI capture in an owned child, including stalled imports, busy registration, and retained timers. Give in-process capture a finite 30-second default deadline while preserving caller runtime and handler identity; arbitrary in-process JavaScript cannot be forcibly canceled. Thanks @SebTardif.
 - Capture and synthetically probe compiled CommonJS plugins with generated SDK mocks, including lazy `require()` calls, and discover their SDK source references. CommonJS mocking requires Node.js 22.15+ synchronous module hooks; the package engine and existing ESM/TypeScript capture remain unchanged.
