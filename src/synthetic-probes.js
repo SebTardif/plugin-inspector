@@ -784,17 +784,20 @@ async function runRegistrationProbes(entry, retainedEntry, captureIndex, options
     return [blockedResult(entry, captureIndex, "captured registration has no supported callable probe")];
   }
 
-  return Promise.all(
-    invocations.map((invocation) =>
-      runProbe({
+  // The profile owns lifecycle order; finish each callback before starting the next.
+  const results = [];
+  for (const invocation of invocations) {
+    results.push(
+      await runProbe({
         captureIndex,
         kind: "registration",
         seam: entry.name,
         label: invocation.label,
         invoke: invocation.invoke,
       }),
-    ),
-  );
+    );
+  }
+  return results;
 }
 
 function registrationInvocations(registrar, descriptor, returnValue, profile, options) {
