@@ -456,8 +456,9 @@ test("synthetic probes finish registerService start before stop and dispose", as
     "      startFinished = true;",
     "      return { started: true };",
     "    },",
-    "    stop() {",
+    "    async stop() {",
     "      if (!startFinished) throw new Error('stop ran before start finished');",
+    "      await new Promise((resolve) => setImmediate(resolve));",
     "      stopFinished = true;",
     "      return { stopped: true };",
     "    },",
@@ -472,7 +473,7 @@ test("synthetic probes finish registerService start before stop and dispose", as
 
   const result = await runCapturedSyntheticProbes(capture, { includeLifecycle: true });
 
-  assert.equal(result.summary.failCount, 0);
+  assert.equal(result.summary.failCount, 0, JSON.stringify(result.results));
   assert.deepEqual(
     result.results.map((item) => `${item.status}:${item.label}`),
     [
