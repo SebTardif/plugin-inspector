@@ -81,7 +81,16 @@ test("profile drains bounded stdout and stderr through close", { timeout: 5000 }
 test("profile output flood stays capped until the production timeout", { timeout: 5000 }, async () => {
   const result = await runProfiledProcess({
     command: process.execPath,
-    args: ["-e", "const fs = require('node:fs'); const b = Buffer.alloc(65536, 'x'); while (true) { fs.writeSync(1, b); fs.writeSync(2, b); }"],
+    args: ["-e", `
+      const { once } = require('node:events');
+      const chunk = Buffer.alloc(65536, 'x');
+      (async () => {
+        while (true) {
+          if (!process.stdout.write(chunk)) await once(process.stdout, 'drain');
+          if (!process.stderr.write(chunk)) await once(process.stderr, 'drain');
+        }
+      })();
+    `],
     timeoutMs: 500,
     killGraceMs: 75,
     maxOutputBytes: 4096,
