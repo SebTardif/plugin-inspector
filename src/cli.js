@@ -115,6 +115,7 @@ async function runCheck(commandArgs, options = {}) {
   const ciOutputs = readCiOutputFlags(commandArgs);
   const authorFacing = readAuthorFacingFlag(commandArgs);
   const { report, paths } = await runPluginCheck({
+    isolateCapture: true,
     allowExecution,
     authorFacing,
     capture,
@@ -279,6 +280,7 @@ async function runCiCompatibilityReport({
   }
 
   const { report } = await runPluginCheck({
+    isolateCapture: true,
     allowExecution,
     authorFacing,
     capture,
@@ -307,7 +309,7 @@ async function runCapture(commandArgs) {
     throw new Error("capture imports plugin code; rerun with PLUGIN_INSPECTOR_EXECUTE_ISOLATED=1 or --allow-execute in an isolated workspace");
   }
 
-  const result = await captureEntrypoint(entrypoint, { mockSdk, pluginRoot });
+  const result = await captureEntrypoint(entrypoint, { mockSdk, pluginRoot, isolateCapture: true });
   const json = `${JSON.stringify(result, null, 2)}\n`;
   if (outputPath) {
     await writeArtifacts([{ path: outputPath, content: json }]);

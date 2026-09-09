@@ -253,6 +253,20 @@ including when channel, provider, or lifecycle execution is enabled.
 Use `--real-sdk` only when the plugin workspace already has real SDK
 dependencies installed and you intentionally want that path.
 
+Real-SDK CLI capture runs in an owned child, including runtime capture enabled
+by flags or plugin config. The parent bounds imports and registration, then
+cleans up retained plugin timers after the child flushes its complete result.
+It uses installed SDK dependencies without loading the mock SDK.
+
+The real-SDK programmatic API stays in-process to preserve supplied runtime
+objects and retained handler identity. Its 30-second default deadline reports
+`capture-timeout`, stops later inspector-owned phases, and aborts supported
+setup reads. Caller `signal` cancellation also stops later phases. Neither
+mechanism can preempt a synchronous JavaScript loop, unload an import, stop
+arbitrary plugin side effects, or clear plugin-owned timers in the caller's
+process. Only owned-child capture provides that process-lifetime boundary.
+Override the API budget with `timeoutMs` or `PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS`.
+
 Runtime capture writes:
 
 - `reports/plugin-inspector-runtime-capture.json`
@@ -264,8 +278,8 @@ Capture one entrypoint directly:
 plugin-inspector capture ./dist/index.js --mock-sdk --allow-execute
 ```
 
-Mock-SDK capture and import-loop/runtime profiles give each child a 30-second
-budget. Mock capture reports `capture-timeout`; timed-out profile samples
+CLI capture, mock-SDK API capture, and import-loop/runtime profiles give each
+child a 30-second budget. Capture reports `capture-timeout`; timed-out profile samples
 always have a nonzero `exitCode`, even if a SIGTERM handler exits zero.
 Pass an `AbortSignal` as `signal` to cancel owned-child work. Cancellation is
 never a successful capture or profile sample.
@@ -280,14 +294,14 @@ termination and the bounded close deadline, not POSIX group cleanup.
 
 The API options `timeoutMs`, `killGraceMs`, and `maxOutputBytes` take precedence
 over `PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS`, `PLUGIN_INSPECTOR_CAPTURE_KILL_GRACE_MS`,
-and `PLUGIN_INSPECTOR_CAPTURE_MAX_OUTPUT_BYTES` for mock capture. Profiles use
+and `PLUGIN_INSPECTOR_CAPTURE_MAX_OUTPUT_BYTES` for owned-child capture. Profiles use
 the corresponding `PLUGIN_INSPECTOR_PROFILE_*` variables. Values must be finite
 positive numbers (zero does not disable limits); invalid values fall through
 to the environment, then defaults. Durations/byte limits cannot exceed
 2,147,483,647; grace cannot exceed 30,000 ms.
 
 Each profiled stdout/stderr stream retains at most 1 MiB by default while
-continuing to drain output. Mock capture retains at most 10 MiB per pipe and
+continuing to drain output. Owned-child capture retains at most 10 MiB per pipe and
 fails if its JSON response is truncated; intercepted plugin stdout/stderr
 inside that response retains at most 1 MiB each. The optional `ps` sampler
 also has bounded output, execution, and cleanup.

@@ -18,7 +18,7 @@ try {
   const json = `${JSON.stringify(result, null, 2)}\n`;
   const { maxOutputBytes } = resolveProcessLimits(options, "CAPTURE");
   if (Buffer.byteLength(json) > maxOutputBytes) {
-    throw new Error(`Mock SDK capture result exceeded its ${maxOutputBytes}-byte limit`);
+    throw new Error(`${options.mockSdk === false ? "Real SDK" : "Mock SDK"} capture result exceeded its ${maxOutputBytes}-byte limit`);
   }
   if (options.outputPath) {
     await writeArtifacts([{ path: options.outputPath, content: json }]);
@@ -37,6 +37,9 @@ try {
 async function run(options) {
   const entrypoint = path.resolve(options.cwd ?? process.cwd(), options.entrypoint);
   const pluginRoot = path.resolve(options.cwd ?? process.cwd(), options.pluginRoot ?? path.dirname(entrypoint));
+  if (options.mockSdk === false) {
+    return await captureLinkedEntrypoint(entrypoint, { ...options, pluginRoot });
+  }
   const workspace = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-mock-sdk-"));
 
   cleanupTempDirOnExit(workspace);
@@ -73,8 +76,8 @@ async function captureLinkedEntrypoint(entrypoint, options) {
     return withProcessOutput(
       {
         status: "no-register-export",
-        entrypoint: options.entrypoint,
-        mockSdk: true,
+        entrypoint: options.mockSdk === false ? entrypoint : options.entrypoint,
+        mockSdk: options.mockSdk !== false,
         captured: [],
       },
       outputCapture,
@@ -95,8 +98,8 @@ async function captureLinkedEntrypoint(entrypoint, options) {
 
   const result = {
     status: "captured",
-    entrypoint: options.entrypoint,
-    mockSdk: true,
+    entrypoint: options.mockSdk === false ? entrypoint : options.entrypoint,
+    mockSdk: options.mockSdk !== false,
     captured: api.getCapturedContracts(),
   };
   if (apiOptions?.retainHandlers === true) {

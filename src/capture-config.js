@@ -6,7 +6,7 @@ export async function captureApiOptionsForPlugin(apiOptions = {}, options = {}) 
     return apiOptions;
   }
 
-  const pluginConfig = await readSamplePluginConfig(options.pluginRoot);
+  const pluginConfig = await readSamplePluginConfig(options.pluginRoot, options.signal);
   if (pluginConfig === undefined) {
     return apiOptions;
   }
@@ -16,15 +16,16 @@ export async function captureApiOptionsForPlugin(apiOptions = {}, options = {}) 
   };
 }
 
-async function readSamplePluginConfig(pluginRoot) {
-  const manifestPath = await findNearestManifestPath(pluginRoot);
+async function readSamplePluginConfig(pluginRoot, signal) {
+  const manifestPath = await findNearestManifestPath(pluginRoot, signal);
   if (!manifestPath) {
     return undefined;
   }
   let manifest;
   try {
-    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest = JSON.parse(await readFile(manifestPath, { encoding: "utf8", signal }));
   } catch {
+    signal?.throwIfAborted();
     return undefined;
   }
 
@@ -32,14 +33,16 @@ async function readSamplePluginConfig(pluginRoot) {
   return isPlainObject(sample) && Object.keys(sample).length > 0 ? sample : undefined;
 }
 
-async function findNearestManifestPath(pluginRoot) {
+async function findNearestManifestPath(pluginRoot, signal) {
   let current = path.resolve(pluginRoot);
   while (true) {
     const manifestPath = path.join(current, "openclaw.plugin.json");
     try {
-      await readFile(manifestPath, "utf8");
+      await readFile(manifestPath, { encoding: "utf8", signal });
       return manifestPath;
-    } catch {}
+    } catch {
+      signal?.throwIfAborted();
+    }
 
     const parent = path.dirname(current);
     if (parent === current) {

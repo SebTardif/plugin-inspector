@@ -5,6 +5,7 @@
 ### Fixed
 
 - Run `registerService` start, stop, and dispose probes serially so teardown cannot overlap startup.
+- Bound real-SDK CLI capture in an owned child, including stalled imports, busy registration, and retained timers. Give in-process capture a finite 30-second default deadline while preserving caller runtime and handler identity; arbitrary in-process JavaScript cannot be forcibly canceled. Thanks @SebTardif.
 - Capture and synthetically probe compiled CommonJS plugins with generated SDK mocks, including lazy `require()` calls, and discover their SDK source references. CommonJS mocking requires Node.js 22.15+ synchronous module hooks; the package engine and existing ESM/TypeScript capture remain unchanged.
 - Bound mock-SDK capture and profile child lifetimes, output, and process sampling; clean owned POSIX descendants through stdio close and keep timeout/cancellation outcomes unsuccessful. Flush complete capture JSON before exiting despite retained plugin timers. Thanks @SebTardif.
 - Profile the default import-loop capture runner directly so its timeout also owns plugin execution. Validate fresh, bounded capture artifacts; RSS/CPU and wall-time measurements now exclude the intermediate CLI wrapper and are not directly comparable with historical profiles.
