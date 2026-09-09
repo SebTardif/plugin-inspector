@@ -232,6 +232,13 @@ That keeps compatibility CI offline and credential-free. It does not call live
 services, launch OpenClaw, run provider SDKs, or emulate service lifecycle side
 effects.
 
+CommonJS SDK mocking, including compiled `.cjs` entrypoints and lazy `require()`
+calls in synthetic handlers, requires Node.js 22.15 or newer with
+`module.registerHooks()`. On older Node versions, upgrade Node.js or use an
+ESM/TypeScript entrypoint. This capability requirement does not change the
+package's Node.js `>=22` engine range or gate existing ESM/TypeScript capture.
+Static inspection also discovers literal CommonJS SDK `require()` references.
+
 The default capture `api.runtime.modelAuth` passes synthetic provider IDs through
 unchanged, returns fresh empty auth stores and profile lists, and reports no
 configured API keys. Auth acquisition rejects with a mock-auth-unavailable error;
@@ -256,6 +263,49 @@ Capture one entrypoint directly:
 ```bash
 plugin-inspector capture ./dist/index.js --mock-sdk --allow-execute
 ```
+
+Mock-SDK capture and import-loop/runtime profiles give each child a 30-second
+budget. Mock capture reports `capture-timeout`; timed-out profile samples
+always have a nonzero `exitCode`, even if a SIGTERM handler exits zero.
+Pass an `AbortSignal` as `signal` to cancel owned-child work. Cancellation is
+never a successful capture or profile sample.
+
+On POSIX, each child owns a separate process group. Completion waits for
+stdout/stderr to close and cleans descendants, including after a successful
+leader exit. Shutdown sends SIGTERM, then SIGKILL after a 1-second grace
+period. A further 1-second close deadline fails the operation if pipes remain
+open. Descendants that deliberately leave the group are not contained;
+this is lifecycle supervision, not a sandbox. Windows retains direct-child
+termination and the bounded close deadline, not POSIX group cleanup.
+
+The API options `timeoutMs`, `killGraceMs`, and `maxOutputBytes` take precedence
+over `PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS`, `PLUGIN_INSPECTOR_CAPTURE_KILL_GRACE_MS`,
+and `PLUGIN_INSPECTOR_CAPTURE_MAX_OUTPUT_BYTES` for mock capture. Profiles use
+the corresponding `PLUGIN_INSPECTOR_PROFILE_*` variables. Values must be finite
+positive numbers (zero does not disable limits); invalid values fall through
+to the environment, then defaults. Durations/byte limits cannot exceed
+2,147,483,647; grace cannot exceed 30,000 ms.
+
+Each profiled stdout/stderr stream retains at most 1 MiB by default while
+continuing to drain output. Mock capture retains at most 10 MiB per pipe and
+fails if its JSON response is truncated; intercepted plugin stdout/stderr
+inside that response retains at most 1 MiB each. The optional `ps` sampler
+also has bounded output, execution, and cleanup.
+
+Default import-loop profiles launch the mock capture runner directly under one
+profile budget, for both baseline and plugin samples. Their JSON artifacts
+retain capture's 10 MiB default limit (`PLUGIN_INSPECTOR_CAPTURE_MAX_OUTPUT_BYTES`,
+or an explicit `maxOutputBytes` override), separately from the profile's
+1 MiB stdout/stderr limits. Artifacts are accepted only after a successful
+current capture. RSS and CPU now measure the actual runner, and wall time no
+longer includes intermediate CLI startup. Historical measurements from the
+CLI-wrapper route are not directly comparable. Custom `captureCommand` and
+`captureScript` launch contracts are unchanged; custom detached groups are
+outside the owned process group.
+
+These limits apply to owned child processes only. The public in-process
+`captureEntrypoint` path preserves retained handler identity and does not
+claim to cancel synchronous plugin code or retained callbacks.
 
 ## CI
 
