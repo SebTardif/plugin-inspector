@@ -232,12 +232,40 @@ That keeps compatibility CI offline and credential-free. It does not call live
 services, launch OpenClaw, run provider SDKs, or emulate service lifecycle side
 effects.
 
+CommonJS SDK mocking, including compiled `.cjs` entrypoints and lazy `require()`
+calls in synthetic handlers, requires Node.js 22.15 or newer with
+`module.registerHooks()`. On older Node versions, upgrade Node.js or use an
+ESM/TypeScript entrypoint. This capability requirement does not change the
+package's Node.js `>=22` engine range or gate existing ESM/TypeScript capture.
+Static inspection also discovers literal CommonJS SDK `require()` references.
+
+The default capture `api.runtime.modelAuth` passes synthetic provider IDs through
+unchanged, returns fresh empty auth stores and profile lists, and reports no
+configured API keys. Auth acquisition rejects with a mock-auth-unavailable error;
+it never looks up host credentials. This supports registration and no-auth
+callbacks, not provider alias validation or authenticated execution. An explicitly
+supplied runtime is preserved unchanged, including an empty runtime.
+
 Synthetic probes classify widget presenters as metadata-only. They record the
 registration without calling its match, availability, or presentation callbacks,
 including when channel, provider, or lifecycle execution is enabled.
 
 Use `--real-sdk` only when the plugin workspace already has real SDK
 dependencies installed and you intentionally want that path.
+
+Real-SDK CLI capture runs in an owned child, including runtime capture enabled
+by flags or plugin config. The parent bounds imports and registration, then
+cleans up retained plugin timers after the child flushes its complete result.
+It uses installed SDK dependencies without loading the mock SDK.
+
+The real-SDK programmatic API stays in-process to preserve supplied runtime
+objects and retained handler identity. Its 30-second default deadline reports
+`capture-timeout`, stops later inspector-owned phases, and aborts supported
+setup reads. Caller `signal` cancellation also stops later phases. Neither
+mechanism can preempt a synchronous JavaScript loop, unload an import, stop
+arbitrary plugin side effects, or clear plugin-owned timers in the caller's
+process. Only owned-child capture provides that process-lifetime boundary.
+Override the API budget with `timeoutMs` or `PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS`.
 
 Runtime capture writes:
 
@@ -249,6 +277,76 @@ Capture one entrypoint directly:
 ```bash
 plugin-inspector capture ./dist/index.js --mock-sdk --allow-execute
 ```
+
+CLI capture, mock-SDK API capture, and import-loop/runtime profiles give each
+child a 30-second budget. Capture reports `capture-timeout`; timed-out profile samples
+always have a nonzero `exitCode`, even if a SIGTERM handler exits zero.
+Pass an `AbortSignal` as `signal` to cancel owned-child work. Cancellation is
+never a successful capture or profile sample.
+
+On POSIX, each child owns a separate process group. Completion waits for
+stdout/stderr to close and cleans descendants, including after a successful
+leader exit. Shutdown sends SIGTERM, then SIGKILL after a 1-second grace
+period. A further 1-second close deadline fails the operation if pipes remain
+open. Descendants that deliberately leave the group are not contained;
+this is lifecycle supervision, not a sandbox. Windows retains direct-child
+termination and the bounded close deadline, not POSIX group cleanup.
+
+The API options `timeoutMs`, `killGraceMs`, and `maxOutputBytes` take precedence
+over `PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS`, `PLUGIN_INSPECTOR_CAPTURE_KILL_GRACE_MS`,
+and `PLUGIN_INSPECTOR_CAPTURE_MAX_OUTPUT_BYTES` for owned-child capture. Profiles use
+the corresponding `PLUGIN_INSPECTOR_PROFILE_*` variables. Values must be finite
+positive numbers (zero does not disable limits); invalid values fall through
+to the environment, then defaults. Durations/byte limits cannot exceed
+2,147,483,647; grace cannot exceed 30,000 ms.
+
+Each profiled stdout/stderr stream retains at most 1 MiB by default while
+continuing to drain output. Owned-child capture retains at most 10 MiB per pipe and
+fails if its JSON response is truncated; intercepted plugin stdout/stderr
+inside that response retains at most 1 MiB each. The optional `ps` sampler
+also has bounded output, execution, and cleanup.
+
+Default import-loop profiles launch the mock capture runner directly under one
+profile budget, for both baseline and plugin samples. Their JSON artifacts
+retain capture's 10 MiB default limit (`PLUGIN_INSPECTOR_CAPTURE_MAX_OUTPUT_BYTES`,
+or an explicit `maxOutputBytes` override), separately from the profile's
+1 MiB stdout/stderr limits. Artifacts are accepted only after a successful
+current capture. RSS and CPU now measure the actual runner, and wall time no
+longer includes intermediate CLI startup. Historical measurements from the
+CLI-wrapper route are not directly comparable. Custom `captureCommand` and
+`captureScript` launch contracts are unchanged; custom detached groups are
+outside the owned process group.
+
+These limits apply to owned child processes only. The public in-process
+`captureEntrypoint` path preserves retained handler identity and does not
+claim to cancel synchronous plugin code or retained callbacks.
+
+Synthetic probe APIs give each invoked callback a 30-second default budget.
+Set `timeoutMs` or `PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS`; the same finite positive
+API-then-environment validation applies, with no zero or infinite opt-out.
+A timed-out callback becomes a failed row and remaining dependent probes are
+blocked. Ordinary handler failures remain failed rows without stopping
+independent probes. Caller `signal` cancellation rejects the API call.
+Timeout and cancellation abort supported handler signal arguments and observe
+late promise settlement, but cannot preempt synchronous JavaScript or arbitrary
+plugin side effects. Programmatic probes stay in-process and preserve caller
+runtime objects and retained callback identity.
+
+`synthetic-probes-cli.js` runs capture and retained callbacks together in one
+owned child. Its whole-child budget also defaults to 30 seconds, including
+imports and registration, with `PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS`,
+`PLUGIN_INSPECTOR_PROBE_KILL_GRACE_MS`, and
+`PLUGIN_INSPECTOR_PROBE_MAX_OUTPUT_BYTES` overrides. Shutdown uses the same
+bounded grace and process-group cleanup as capture. The default report and
+per-pipe limit is 10 MiB, matching capture; intercepted plugin stdout and stderr are each capped
+at 1 MiB and kept separate from the report protocol.
+
+Completed synthetic reports are still written even when they contain failed
+probe rows; the CLI exits successfully after delivering them, and CI policy
+evaluates those rows. Child timeout, cancellation, truncated output, or an
+oversized report instead exits unsuccessfully without writing a new output
+artifact. Healthy retained intervals cannot keep the child alive after its
+complete report is flushed.
 
 ## CI
 

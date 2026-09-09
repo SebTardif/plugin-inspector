@@ -145,7 +145,6 @@ export const synthetic = Object.freeze({
   defaultHookEvents: syntheticProbesApi.defaultSyntheticHookEvents,
   defaultHookContexts: syntheticProbesApi.defaultSyntheticHookContexts,
   defaultRegistrationArguments: syntheticProbesApi.defaultSyntheticRegistrationArguments,
-  defaultTimeoutMs: syntheticProbesApi.defaultProbeTimeoutMs,
 });
 
 export {
@@ -262,12 +261,10 @@ export { runEntrypointSyntheticProbes } from "./synthetic-entrypoint.js";
 export { buildSyntheticProbePlanFromReport } from "./synthetic-probe-suite.js";
 export {
   buildSyntheticProbePlan,
-  defaultProbeTimeoutMs,
   defaultSyntheticHookContexts,
   defaultSyntheticHookEvents,
   defaultSyntheticRegistrationArguments,
   renderSyntheticProbeMarkdown,
-  resolveProbeTimeoutMs,
   runCapturedSyntheticProbes,
   syntheticRegistrationExecutionProfiles,
   validateSyntheticProbePlan,

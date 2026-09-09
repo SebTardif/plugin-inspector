@@ -12,6 +12,7 @@ export async function buildRuntimeCaptureReport(options = {}) {
   const results = [];
   for (const fixture of report.fixtures) {
     for (const target of captureTargets(fixture, rootDir)) {
+      options.signal?.throwIfAborted();
       results.push(await captureTarget(target, options));
     }
   }
@@ -117,6 +118,11 @@ async function captureTarget(target, options) {
       mockSdk: options.mockSdk !== false,
       apiOptions: options.apiOptions,
       env: options.env,
+      isolateCapture: options.isolateCapture,
+      timeoutMs: options.timeoutMs,
+      killGraceMs: options.killGraceMs,
+      maxOutputBytes: options.maxOutputBytes,
+      signal: options.signal,
     });
     return {
       fixture: target.fixture,

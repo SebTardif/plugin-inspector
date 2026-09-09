@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+
+- Bound synthetic callback waits and cancellation, stop dependent probes after a timeout, and supervise CLI capture plus retained callbacks in one child. Preserve complete failed-row reports, bounded plugin output, and in-process callback identity. Thanks @SebTardif.
+- Run `registerService` start, stop, and dispose probes serially so teardown cannot overlap startup.
+- Bound real-SDK CLI capture in an owned child, including stalled imports, busy registration, and retained timers. Give in-process capture a finite 30-second default deadline while preserving caller runtime and handler identity; arbitrary in-process JavaScript cannot be forcibly canceled. Thanks @SebTardif.
+- Capture and synthetically probe compiled CommonJS plugins with generated SDK mocks, including lazy `require()` calls, and discover their SDK source references. CommonJS mocking requires Node.js 22.15+ synchronous module hooks; the package engine and existing ESM/TypeScript capture remain unchanged.
+- Bound mock-SDK capture and profile child lifetimes, output, and process sampling; clean owned POSIX descendants through stdio close and keep timeout/cancellation outcomes unsuccessful. Flush complete capture JSON before exiting despite retained plugin timers. Thanks @SebTardif.
+- Profile the default import-loop capture runner directly so its timeout also owns plugin execution. Validate fresh, bounded capture artifacts; RSS/CPU and wall-time measurements now exclude the intermediate CLI wrapper and are not directly comparable with historical profiles.
+- Bound OpenClaw npm metadata and tarball downloads with a deadline through response-body reads, reject oversized responses, and release failed downloads. Resolve `latest` and `beta` through the small npm dist-tags endpoint before fetching exact-version metadata, keeping the 16 MiB metadata limit usable.
+
+- Capture plugins that bind `api.runtime.modelAuth` during registration with credential-free defaults; auth acquisition remains an explicit synthetic failure.
+- Report absent build output and missing entrypoints before SDK alias blockers in cold-import readiness, preserving build-required totals and all remediation evidence.
+- Recognize board widget content kinds, memory prompt preparation, transcript source providers, worker providers, and MCP server connection resolvers as metadata-only synthetic probes without invoking runtime callbacks.
+
 ## 0.3.24 - 2026-08-31
 
 ### Fixed

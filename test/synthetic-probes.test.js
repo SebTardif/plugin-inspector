@@ -3,15 +3,14 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   buildSyntheticProbePlan,
   captureEntrypoint,
   createCaptureApi,
-  defaultProbeTimeoutMs,
   defaultSyntheticHookContexts,
   defaultSyntheticHookEvents,
   renderSyntheticProbeMarkdown,
-  resolveProbeTimeoutMs,
   runCapturedSyntheticProbes,
   runEntrypointSyntheticProbes,
   validateSyntheticProbePlan,
@@ -116,6 +115,7 @@ test("synthetic probe plan classifies generated kitchen-sink registrars", () => 
     "registerAgentHarness",
     "registerAgentToolResultMiddleware",
     "registerAutoEnableProbe",
+    "registerBoardWidgetContentKind",
     "registerChannel",
     "defineBundledChannelEntry",
     "registerCli",
@@ -135,12 +135,14 @@ test("synthetic probe plan classifies generated kitchen-sink registrars", () => 
     "registerHttpRoute",
     "registerImageGenerationProvider",
     "registerInteractiveHandler",
+    "registerMcpServerConnectionResolver",
     "registerMediaUnderstandingProvider",
     "registerMeetingNotesSourceProvider",
     "registerMemoryCapability",
     "registerMemoryCorpusSupplement",
     "registerMemoryEmbeddingProvider",
     "registerMemoryFlushPlan",
+    "registerMemoryPromptPreparation",
     "registerMemoryPromptSection",
     "registerMemoryPromptSupplement",
     "registerMemoryRuntime",
@@ -165,11 +167,13 @@ test("synthetic probe plan classifies generated kitchen-sink registrars", () => 
     "registerTextTransforms",
     "registerTool",
     "registerToolMetadata",
+    "registerTranscriptSourceProvider",
     "registerTrustedToolPolicy",
     "registerVideoGenerationProvider",
     "registerWebFetchProvider",
     "registerWebSearchProvider",
     "registerWidgetPresenter",
+    "registerWorkerProvider",
   ];
   const plan = buildSyntheticProbePlan({
     capture: {
@@ -196,12 +200,12 @@ test("synthetic probe plan classifies generated kitchen-sink registrars", () => 
   assert.deepEqual(validateSyntheticProbePlan(plan), []);
 });
 
-test("synthetic probes capture widget presenters without invoking runtime callbacks", async () => {
+test("synthetic probes capture metadata-only registrars without invoking runtime callbacks", async () => {
   const api = createCaptureApi({ retainHandlers: true });
   const invoked = [];
   const callback = (name) => () => { invoked.push(name); };
-  for (const target of ["current_channel", "node_panel"]) {
-    api.registerWidgetPresenter({
+  const registrations = [
+    ...["current_channel", "node_panel"].map((target) => ["registerWidgetPresenter", {
       target,
       description: `Fixture ${target}`,
       availability: callback(`${target}.availability`),
@@ -209,21 +213,72 @@ test("synthetic probes capture widget presenters without invoking runtime callba
       ...(target === "current_channel"
         ? { match: callback(`${target}.match`), capabilities: { sourceKinds: ["html"] } }
         : {}),
-    });
+    }]),
+    ["registerBoardWidgetContentKind", {
+      kind: "fixture",
+      label: "Fixture",
+      resources: {
+        surface: "fixture",
+        paths: [],
+        readPublicResource: callback("board.readPublicResource"),
+      },
+      validateSource: callback("board.validateSource"),
+      composeDocument: callback("board.composeDocument"),
+    }],
+    ["registerMemoryPromptPreparation", async () => {
+      invoked.push("memory.prepare");
+      return [];
+    }],
+    ["registerTranscriptSourceProvider", {
+      id: "fixture",
+      name: "Fixture",
+      sourceKinds: ["live-audio", "posthoc-transcript"],
+      start: callback("transcript.start"),
+      watchOccupancy: callback("transcript.watchOccupancy"),
+      stop: callback("transcript.stop"),
+      status: callback("transcript.status"),
+      importTranscript: callback("transcript.importTranscript"),
+    }],
+    ["registerWorkerProvider", {
+      id: "fixture",
+      resolveAllocation: callback("worker.resolveAllocation"),
+      provision: callback("worker.provision"),
+      inspect: callback("worker.inspect"),
+      renew: callback("worker.renew"),
+      destroy: callback("worker.destroy"),
+    }],
+    ["registerMcpServerConnectionResolver", {
+      serverName: "fixture",
+      resolve: callback("mcp.resolve"),
+    }],
+  ];
+  for (const [registrar, argument] of registrations) {
+    api[registrar](argument);
   }
   const capture = {
     status: "captured",
     captured: api.getCapturedContracts(),
     retained: api.getRetainedContracts(),
   };
+  assert.deepEqual(capture.captured.map((entry) => entry.name), registrations.map(([registrar]) => registrar));
+  assert.equal(capture.retained.length, registrations.length);
+  for (const [index, [registrar, argument]] of registrations.entries()) {
+    assert.equal(capture.retained[index].name, registrar);
+    assert.equal(capture.retained[index].arguments[0], argument);
+  }
 
   for (const options of [{}, { includeLifecycle: true, includeChannelRuntime: true, includeProviderCapabilities: true }]) {
     const result = await runCapturedSyntheticProbes(capture, options);
 
-    assert.deepEqual(result.summary, { probeCount: 2, passCount: 2, failCount: 0, blockedCount: 0 });
+    assert.deepEqual(result.summary, {
+      probeCount: registrations.length,
+      passCount: registrations.length,
+      failCount: 0,
+      blockedCount: 0,
+    });
     assert.deepEqual(
       result.results.map((item) => [item.seam, item.output.mode]),
-      [["registerWidgetPresenter", "metadata-only"], ["registerWidgetPresenter", "metadata-only"]],
+      registrations.map(([registrar]) => [registrar, "metadata-only"]),
     );
     assert.deepEqual(invoked, []);
   }
@@ -390,12 +445,6 @@ test("synthetic probes keep opt-in registrations guarded", async () => {
   assert.equal(executed.results[0].label, "registerService.start");
 });
 
-test("default synthetic probe timeout matches the 30s capture budget", () => {
-  assert.equal(defaultProbeTimeoutMs, 30_000);
-  assert.equal(resolveProbeTimeoutMs({}), 30_000);
-  assert.equal(resolveProbeTimeoutMs({ timeoutMs: 50 }), 50);
-});
-
 test("synthetic probes fail a hanging invoke instead of waiting forever", { timeout: 2000 }, async () => {
   const capture = await captureLocalFixture([
     "export function register(api) {",
@@ -409,6 +458,172 @@ test("synthetic probes fail a hanging invoke instead of waiting forever", { time
   assert.equal(result.results[0].status, "fail");
   assert.equal(result.results[0].label, "before_tool_call");
   assert.match(result.results[0].error, /timed out after 50ms/);
+});
+
+test("synthetic probe budgets use valid API then environment values", { timeout: 3000 }, async (t) => {
+  const capture = captureRetained((api) => api.on("before_tool_call", () => new Promise(() => {})));
+  for (const timeoutMs of [25, 0, -1, NaN, Infinity, 2 ** 31]) {
+    await t.test(String(timeoutMs), async () => {
+      const expected = timeoutMs === 25 ? 25 : 40;
+      const result = await runCapturedSyntheticProbes(capture, {
+        timeoutMs, env: { PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS: "40" },
+      });
+      assert.equal(result.summary.failCount, 1);
+      assert.equal(result.results[0].error, `Synthetic probe timed out after ${expected}ms`);
+    });
+  }
+});
+
+test("synthetic probe default stays finite after invalid environment values", { timeout: 3000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const value of ["invalid", "0", "Infinity", "2147483648", "25ms"]) {
+    let started;
+    const invoked = new Promise((resolve) => { started = resolve; });
+    const capture = captureRetained((api) => api.on("before_tool_call", () => {
+      started();
+      return new Promise(() => {});
+    }));
+    const pending = runCapturedSyntheticProbes(capture, { env: { PLUGIN_INSPECTOR_PROBE_TIMEOUT_MS: value } });
+    await invoked;
+    t.mock.timers.tick(30_000);
+    const result = await pending;
+    assert.equal(result.results[0].error, "Synthetic probe timed out after 30000ms", value);
+  }
+});
+
+test("synthetic probe timeout aborts supported input and blocks dependent work", { timeout: 3000 }, async () => {
+  const calls = [];
+  let signal;
+  const capture = captureRetained((api) => {
+    api.registerService({
+      name: "fixture",
+      start(ctx) {
+        signal = ctx.signal;
+        calls.push("start");
+        return new Promise((_, reject) => {
+          signal.addEventListener("abort", () => {
+            calls.push("abort");
+            reject(signal.reason);
+          }, { once: true });
+        });
+      },
+      stop() { calls.push("stop"); },
+      dispose() { calls.push("dispose"); },
+    });
+    api.on("before_tool_call", () => { calls.push("later"); });
+  });
+  const result = await runCapturedSyntheticProbes(capture, { includeLifecycle: true, timeoutMs: 25 });
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(calls, ["start", "abort"]);
+  assert.deepEqual(result.results.map((row) => [row.label, row.status]), [
+    ["registerService.start", "fail"],
+    ["registerService.stop", "blocked"],
+    ["registerService.dispose", "blocked"],
+    ["before_tool_call", "blocked"],
+  ]);
+});
+
+test("synthetic probe cancellation rejects and prevents later callbacks", { timeout: 3000 }, async () => {
+  let started;
+  const invoked = new Promise((resolve) => { started = resolve; });
+  let later = 0;
+  let receivedSignal;
+  const capture = captureRetained((api) => {
+    api.registerTool({
+      name: "fixture",
+      execute(_id, _params, signal) {
+        receivedSignal = signal;
+        started();
+        return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      },
+    });
+    api.on("before_tool_call", () => { later += 1; });
+  });
+  const controller = new AbortController();
+  const pending = runCapturedSyntheticProbes(capture, { signal: controller.signal, timeoutMs: 100 });
+  const rejected = assert.rejects(pending, /cancelled/);
+  await invoked;
+  controller.abort();
+  await rejected;
+  assert.equal(receivedSignal.aborted, true);
+  assert.equal(later, 0);
+});
+
+test("already cancelled synthetic probes do not invoke plugin code", async () => {
+  let calls = 0;
+  const capture = captureRetained((api) => api.on("before_tool_call", () => { calls += 1; }));
+  await assert.rejects(runCapturedSyntheticProbes(capture, { signal: AbortSignal.abort() }));
+  assert.equal(calls, 0);
+});
+
+test("synthetic probes observe late rejection without starting later work", { timeout: 3000 }, async () => {
+  let later = 0;
+  const capture = captureRetained((api) => {
+    api.on("before_tool_call", () => new Promise((_, reject) => setTimeout(() => reject(new Error("late failure")), 75)));
+    api.registerCommand({ name: "later", handler() { later += 1; } });
+  });
+  const result = await runCapturedSyntheticProbes(capture, { timeoutMs: 25 });
+  await delay(100);
+  assert.equal(result.summary.failCount, 1);
+  assert.equal(result.results[1].status, "blocked");
+  assert.equal(later, 0);
+});
+
+test("synthetic entrypoint API preserves supplied runtime and retained callback identity", async () => {
+  const event = { toolName: "identity-fixture" };
+  let calls = 0;
+  const handler = (actual) => { assert.equal(actual, event); calls += 1; return "identity-ok"; };
+  const runtime = { handler };
+  const capture = await captureLocalFixture([
+    "export function register(api) { api.on('before_tool_call', api.runtime.handler); }",
+  ], { apiOptions: { runtime } });
+  assert.equal(capture.retained[0].handler, handler);
+  const result = await runEntrypointSyntheticProbes(capture.entrypoint, {
+    apiOptions: { runtime }, hookEvents: { before_tool_call: event },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.results[0].output.value, "identity-ok");
+  assert.deepEqual(Object.keys(runtime), ["handler"]);
+});
+
+test("synthetic probes finish registerService start before stop and dispose", async () => {
+  const capture = await captureLocalFixture([
+    "let startFinished = false;",
+    "let stopFinished = false;",
+    "export function register(api) {",
+    "  api.registerService({",
+    "    name: 'fixture_service',",
+    "    async start() {",
+    "      await new Promise((resolve) => setImmediate(resolve));",
+    "      startFinished = true;",
+    "      return { started: true };",
+    "    },",
+    "    async stop() {",
+    "      if (!startFinished) throw new Error('stop ran before start finished');",
+    "      await new Promise((resolve) => setImmediate(resolve));",
+    "      stopFinished = true;",
+    "      return { stopped: true };",
+    "    },",
+    "    dispose() {",
+    "      if (!startFinished) throw new Error('dispose ran before start finished');",
+    "      if (!stopFinished) throw new Error('dispose ran before stop finished');",
+    "      return { disposed: true };",
+    "    },",
+    "  });",
+    "}",
+  ]);
+
+  const result = await runCapturedSyntheticProbes(capture, { includeLifecycle: true });
+
+  assert.equal(result.summary.failCount, 0, JSON.stringify(result.results));
+  assert.deepEqual(
+    result.results.map((item) => `${item.status}:${item.label}`),
+    [
+      "pass:registerService.start",
+      "pass:registerService.stop",
+      "pass:registerService.dispose",
+    ],
+  );
 });
 
 test("mock SDK capture preserves retained registration metadata across subprocesses", async () => {
@@ -575,11 +790,56 @@ test("mock SDK windows spawn helpers return concrete invocations", async () => {
   assert.deepEqual(result.results[0].output, { type: "object", keys: ["async", "sync"] });
 });
 
-async function captureLocalFixture(lines) {
+for (const mockSdk of [false, true]) {
+  test(`synthetic modelAuth executes no-auth handlers and fails uncaught auth (mockSdk=${mockSdk})`, async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-probes-model-auth-"));
+    const entrypoint = path.join(dir, "fixture.mjs");
+    await writeFile(entrypoint, [
+      'import assert from "node:assert/strict";',
+      "export function register(api) {",
+      "  const { resolveProviderIdForAuth, ensureAuthProfileStore, isProviderApiKeyConfigured } = api.runtime.modelAuth;",
+      "  api.registerTool({",
+      "    name: resolveProviderIdForAuth('fixture-provider'),",
+      "    run() {",
+      "      assert.equal(isProviderApiKeyConfigured({ provider: 'fixture-provider' }), false);",
+      "      assert.deepEqual(ensureAuthProfileStore(), { version: 1, profiles: {} });",
+      "      return resolveProviderIdForAuth('fixture-provider');",
+      "    },",
+      "  });",
+      "  api.on('before_tool_call', () => api.runtime.modelAuth.getRuntimeAuthForModel({ model: { provider: 'fixture-provider' } }));",
+      "  const unexpected = () => { throw new Error('opt-in callback executed'); };",
+      "  api.registerService({ name: 'fixture-service', start: unexpected });",
+      "  api.registerChannel({ id: 'fixture-channel', send: unexpected });",
+      "  api.registerSpeechProvider({ id: 'fixture-speech', speak: unexpected });",
+      "}",
+    ].join("\n"), "utf8");
+
+    const result = await runEntrypointSyntheticProbes(entrypoint, { mockSdk });
+
+    assert.deepEqual(result.summary, { probeCount: 5, passCount: 1, failCount: 1, blockedCount: 3 });
+    assert.deepEqual(result.results[0].output, { type: "string", value: "fixture-provider" });
+    assert.equal(result.results[1].status, "fail");
+    assert.equal(result.results[1].error, "Model auth is unavailable in capture mocks");
+    assert.deepEqual(result.results.slice(2).map((item) => item.reason), [
+      "captured registration requires includeLifecycle=true",
+      "captured registration requires includeChannelRuntime=true",
+      "captured registration requires includeProviderCapabilities=true",
+    ]);
+  });
+}
+
+function captureRetained(register) {
+  const api = createCaptureApi({ retainHandlers: true });
+  register(api);
+  return { status: "captured", captured: api.getCapturedContracts(), retained: api.getRetainedContracts() };
+}
+
+async function captureLocalFixture(lines, options = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-probes-"));
   const entrypoint = path.join(dir, "fixture.mjs");
   await writeFile(entrypoint, `${lines.join("\n")}\n`, "utf8");
   return captureEntrypoint(entrypoint, {
-    apiOptions: { retainHandlers: true },
+    ...options,
+    apiOptions: { ...options.apiOptions, retainHandlers: true },
   });
 }

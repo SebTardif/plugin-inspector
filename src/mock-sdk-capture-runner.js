@@ -1,37 +1,56 @@
 #!/usr/bin/env node
 import { rmSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
-import { register } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { writeArtifacts } from "./artifacts.js";
 import { createCaptureApi } from "./capture-api.js";
 import { captureApiOptionsForPlugin } from "./capture-config.js";
-import { createMockSdkPackage } from "./sdk-mock.js";
+import { createCappedCollector, resolveProcessLimits } from "./process-profile.js";
+import { createMockSdkPackage, installMockSdkLoader } from "./sdk-mock.js";
 
 const options = JSON.parse(process.argv[2] ?? "{}");
 let activeOutputCapture = null;
 
 try {
   const result = await run(options);
-  writeRunnerStdout(`${JSON.stringify(result, null, 2)}\n`);
+  const json = `${JSON.stringify(result, null, 2)}\n`;
+  const { maxOutputBytes } = resolveProcessLimits(options, options.syntheticProbes ? "PROBE" : "CAPTURE");
+  if (Buffer.byteLength(json) > maxOutputBytes) {
+    const label = options.syntheticProbes ? "Synthetic probe" : `${options.mockSdk === false ? "Real SDK" : "Mock SDK"} capture`;
+    throw new Error(`${label} result exceeded its ${maxOutputBytes}-byte limit`);
+  }
+  if (options.outputPath) {
+    await writeArtifacts([{ path: options.outputPath, content: json }]);
+  } else {
+    await writeRunnerStdout(json);
+  }
+  process.exit(0);
 } catch (error) {
   if (error.failureClass) {
-    writeRunnerStderr(`[plugin-inspector:${error.failureClass}]\n`);
+    await writeRunnerStderr(`[plugin-inspector:${error.failureClass}]\n`);
   }
-  writeRunnerStderr(`${error.stack ?? error.message}\n`);
-  process.exitCode = 1;
+  await writeRunnerStderr(`${options.outputPath ? error.message : (error.stack ?? error.message)}\n`);
+  process.exit(1);
 }
 
 async function run(options) {
   const entrypoint = path.resolve(options.cwd ?? process.cwd(), options.entrypoint);
   const pluginRoot = path.resolve(options.cwd ?? process.cwd(), options.pluginRoot ?? path.dirname(entrypoint));
+  if (options.mockSdk === false) {
+    return await captureLinkedEntrypoint(entrypoint, { ...options, pluginRoot });
+  }
   const workspace = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-mock-sdk-"));
 
   cleanupTempDirOnExit(workspace);
-  const { loaderPath } = await createMockSdkPackage(workspace, { pluginRoot });
-  register(pathToFileURL(loaderPath));
-  return await captureLinkedEntrypoint(entrypoint, { ...options, pluginRoot });
+  const mockPackage = await createMockSdkPackage(workspace, { pluginRoot });
+  const stopLoader = await installMockSdkLoader(mockPackage);
+  try {
+    return await captureLinkedEntrypoint(entrypoint, { ...options, pluginRoot });
+  } finally {
+    stopLoader();
+  }
 }
 
 function cleanupTempDirOnExit(dir) {
@@ -55,14 +74,15 @@ async function captureLinkedEntrypoint(entrypoint, options) {
 
   if (!register) {
     await drainAsyncOutput();
-    return withProcessOutput(
+    return finishCapture(
       {
         status: "no-register-export",
-        entrypoint: options.entrypoint,
-        mockSdk: true,
+        entrypoint: options.mockSdk === false ? entrypoint : options.entrypoint,
+        mockSdk: options.mockSdk !== false,
         captured: [],
       },
       outputCapture,
+      options,
     );
   }
 
@@ -80,12 +100,21 @@ async function captureLinkedEntrypoint(entrypoint, options) {
 
   const result = {
     status: "captured",
-    entrypoint: options.entrypoint,
-    mockSdk: true,
+    entrypoint: options.mockSdk === false ? entrypoint : options.entrypoint,
+    mockSdk: options.mockSdk !== false,
     captured: api.getCapturedContracts(),
   };
   if (apiOptions?.retainHandlers === true) {
     result.retained = api.getRetainedContracts();
+  }
+  return finishCapture(result, outputCapture, options);
+}
+
+async function finishCapture(result, outputCapture, options) {
+  if (options.syntheticProbes) {
+    const { runCapturedSyntheticProbes } = await import("./synthetic-probes.js");
+    result = await runCapturedSyntheticProbes(result, options);
+    await drainAsyncOutput();
   }
   return withProcessOutput(result, outputCapture);
 }
@@ -124,18 +153,18 @@ function findRegisterExport(module) {
 }
 
 function installProcessOutputCapture() {
-  const stdoutChunks = [];
-  const stderrChunks = [];
+  const stdout = createCappedCollector(1024 * 1024);
+  const stderr = createCappedCollector(1024 * 1024);
   const originalStdoutWrite = process.stdout.write.bind(process.stdout);
   const originalStderrWrite = process.stderr.write.bind(process.stderr);
 
   process.stdout.write = (chunk, encoding, callback) => {
-    stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+    stdout.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), typeof encoding === "string" ? encoding : "utf8"));
     invokeWriteCallback(encoding, callback);
     return true;
   };
   process.stderr.write = (chunk, encoding, callback) => {
-    stderrChunks.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+    stderr.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), typeof encoding === "string" ? encoding : "utf8"));
     invokeWriteCallback(encoding, callback);
     return true;
   };
@@ -143,8 +172,8 @@ function installProcessOutputCapture() {
   return {
     originalStdoutWrite,
     originalStderrWrite,
-    stdout: () => stdoutChunks.join(""),
-    stderr: () => stderrChunks.join(""),
+    stdout: () => stdout.text(),
+    stderr: () => stderr.text(),
   };
 }
 
@@ -162,9 +191,19 @@ async function drainAsyncOutput() {
 }
 
 function writeRunnerStdout(text) {
-  (activeOutputCapture?.originalStdoutWrite ?? process.stdout.write.bind(process.stdout))(text);
+  const write = activeOutputCapture?.originalStdoutWrite ?? process.stdout.write.bind(process.stdout);
+  return flushWrite(write, text);
 }
 
 function writeRunnerStderr(text) {
-  (activeOutputCapture?.originalStderrWrite ?? process.stderr.write.bind(process.stderr))(text);
+  const write = activeOutputCapture?.originalStderrWrite ?? process.stderr.write.bind(process.stderr);
+  return flushWrite(write, text);
+}
+
+// The runner exits deliberately to shed plugin timers, but only after the
+// complete protocol response has reached its pipe.
+function flushWrite(write, text) {
+  return new Promise((resolve, reject) => {
+    write(text, (error) => error ? reject(error) : resolve());
+  });
 }
