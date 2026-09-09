@@ -28,8 +28,8 @@ export async function resolveOpenClawTargetVersion(requestedVersion, options = {
   let distTag = null;
 
   if (supportedTags.has(requested)) {
-    const metadata = await fetchJson(`${registryUrl}/openclaw`, fetchImpl, options);
-    version = metadata["dist-tags"]?.[requested];
+    const distTags = await fetchJson(`${registryUrl}/-/package/openclaw/dist-tags`, fetchImpl, options);
+    version = distTags?.[requested];
     if (typeof version !== "string" || version.length === 0) {
       throw new Error(`OpenClaw npm dist-tag ${requested} did not resolve to an exact version`);
     }
@@ -142,6 +142,7 @@ async function preparePackageArchive(resolvedTarget, options) {
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const response = await fetchWithTimeout(fetchImpl, downloadUrlFor(resolvedTarget), {}, options, "npm archive");
   if (!response.ok) {
+    await cancelBody(response.body);
     throw new Error(`failed to download OpenClaw ${resolvedTarget.version}: HTTP ${response.status}`);
   }
   const archive = await readLimitedBody(response, maxArchiveBytes(options), "npm archive");
@@ -202,7 +203,10 @@ async function fetchJson(url, fetchImpl, options = {}) {
     options,
     "npm metadata",
   );
-  if (!response.ok) throw new Error(`failed to resolve OpenClaw npm metadata: HTTP ${response.status}`);
+  if (!response.ok) {
+    await cancelBody(response.body);
+    throw new Error(`failed to resolve OpenClaw npm metadata: HTTP ${response.status}`);
+  }
   const body = await readLimitedBody(response, maxMetadataBytes(options), "npm metadata");
   return JSON.parse(body.toString("utf8"));
 }
@@ -218,12 +222,11 @@ async function fetchWithTimeout(fetchImpl, url, init, options, what) {
 async function readLimitedBody(response, maxBytes, what) {
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes) {
-    try {
-      await response.body?.cancel?.();
-    } catch {}
+    await cancelBody(response.body);
     throw targetDownloadLimitError(what, maxBytes);
   }
 
+  let reader;
   try {
     if (!response.body || typeof response.body.getReader !== "function") {
       const buffer = Buffer.from(await response.arrayBuffer());
@@ -231,7 +234,7 @@ async function readLimitedBody(response, maxBytes, what) {
       return buffer;
     }
 
-    const reader = response.body.getReader();
+    reader = response.body.getReader();
     const chunks = [];
     let received = 0;
     while (true) {
@@ -249,11 +252,24 @@ async function readLimitedBody(response, maxBytes, what) {
     return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
   } catch (error) {
     throw mapTargetFetchError(error, what);
+  } finally {
+    reader?.releaseLock();
   }
 }
 
+async function cancelBody(body) {
+  try {
+    await body?.cancel?.();
+  } catch {}
+}
+
 function fetchTimeoutMs(options) {
-  return positiveInteger(options.fetchTimeoutMs ?? process.env.PLUGIN_INSPECTOR_TARGET_FETCH_TIMEOUT_MS, defaultFetchTimeoutMs);
+  const timeout = positiveInteger(
+    options.fetchTimeoutMs ?? process.env.PLUGIN_INSPECTOR_TARGET_FETCH_TIMEOUT_MS,
+    defaultFetchTimeoutMs,
+  );
+  // Node clamps overflowing timer delays to 1ms instead of honoring the budget.
+  return timeout <= 2_147_483_647 ? timeout : defaultFetchTimeoutMs;
 }
 
 function maxArchiveBytes(options) {

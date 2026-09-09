@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Abort hung OpenClaw npm metadata and tarball fetches and reject oversized archives before buffering them.
+- Bound OpenClaw npm metadata and tarball downloads with a deadline through response-body reads, reject oversized responses, and release failed downloads. Resolve `latest` and `beta` through the small npm dist-tags endpoint before fetching exact-version metadata, keeping the 16 MiB metadata limit usable.
 
 - Capture plugins that bind `api.runtime.modelAuth` during registration with credential-free defaults; auth acquisition remains an explicit synthetic failure.
 

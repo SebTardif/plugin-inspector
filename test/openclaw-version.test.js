@@ -76,6 +76,18 @@ test("targets without verifiable npm integrity metadata are rejected", async (t)
   );
 });
 
+test("an archive integrity mismatch leaves no prepared target", async (t) => {
+  const fixture = await createRegistryFixture(t);
+  fixture.distMetadata.integrity = `sha512-${Buffer.alloc(64).toString("base64")}`;
+  const target = await resolveOpenClawTargetVersion(affectedBeta, { registryUrl: fixture.registryUrl });
+
+  await assert.rejects(
+    () => prepareOpenClawTarget(target, { cacheDir: fixture.cacheDir }),
+    /failed integrity verification/,
+  );
+  assert.equal(fs.existsSync(fixture.cacheDir), false);
+});
+
 for (const kind of ["metadata", "archive"]) {
   for (const behavior of ["stalled-headers", "stalled-body", "oversized-declared", "oversized-chunked", "http-error"]) {
     test(`OpenClaw ${kind} ${behavior} releases the response without preparing a cache entry`, { timeout: 3_000 }, async (t) => {
