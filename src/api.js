@@ -226,6 +226,13 @@ export async function runPluginCheck(options = {}) {
       mockSdk,
       report,
       rootDir: config.rootDir,
+      isolateCapture: options.isolateCapture,
+      timeoutMs: options.timeoutMs,
+      killGraceMs: options.killGraceMs,
+      maxOutputBytes: options.maxOutputBytes,
+      signal: options.signal,
+      env: options.env,
+      apiOptions: options.apiOptions,
     });
     const runtimeCapturePaths = await writeRuntimeCaptureReport(runtimeCapture, {
       jsonPath: path.resolve(config.rootDir, outDir, "plugin-inspector-runtime-capture.json"),
