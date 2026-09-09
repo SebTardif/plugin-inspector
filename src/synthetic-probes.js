@@ -784,40 +784,17 @@ async function runRegistrationProbes(entry, retainedEntry, captureIndex, options
     return [blockedResult(entry, captureIndex, "captured registration has no supported callable probe")];
   }
 
-  // Match hook ordering: start, then other callables, then stop/dispose.
-  // Overlapping start with teardown races plugin lifecycle.
-  const results = [];
-  for (const invocation of orderRegistrationInvocations(invocations)) {
-    results.push(
-      await runProbe({
+  return Promise.all(
+    invocations.map((invocation) =>
+      runProbe({
         captureIndex,
         kind: "registration",
         seam: entry.name,
         label: invocation.label,
         invoke: invocation.invoke,
       }),
-    );
-  }
-  return results;
-}
-
-function orderRegistrationInvocations(invocations) {
-  return [...invocations].sort(
-    (left, right) => registrationLifecyclePhase(left.label) - registrationLifecyclePhase(right.label),
+    ),
   );
-}
-
-function registrationLifecyclePhase(label) {
-  if (label.endsWith(".start")) {
-    return 0;
-  }
-  if (label.endsWith(".stop")) {
-    return 2;
-  }
-  if (label.endsWith(".dispose")) {
-    return 3;
-  }
-  return 1;
 }
 
 function registrationInvocations(registrar, descriptor, returnValue, profile, options) {
