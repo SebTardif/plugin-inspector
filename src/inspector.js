@@ -1,21 +1,19 @@
 import { existsSync } from "node:fs";
-import { execFile } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import * as nodeModule from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 import { createCaptureApi } from "./capture-api.js";
 import { captureApiOptionsForPlugin } from "./capture-config.js";
 import { fixtureCheckoutPath, fixtureSourceRoot } from "./config.js";
 import { buildCompatibilityFixtureReport } from "./fixture-summary.js";
 import { readOpenClawTargetSurface } from "./openclaw-target.js";
 import { prepareOpenClawTarget, resolveOpenClawTargetVersion } from "./openclaw-version.js";
+import { resolveProcessLimits, startOwnedProcess } from "./process-profile.js";
 import { buildCompatibilityReport, buildReport } from "./report.js";
 import { inspectSdkDeprecations } from "./sdk-deprecation-rules.js";
+import { collectCommonJsRequires } from "./sdk-mock.js";
 
-const execFileAsync = promisify(execFile);
-export const defaultCaptureTimeoutMs = 30_000;
 const pluginFactoryNames = "defineBundledChannelEntry|defineChannelPluginEntry|createChatChannelPlugin|definePluginEntry";
 // Bundlers emit unbound calls as (0, sdk.factory)(...), including inline require receivers.
 const compiledFactoryCall = new RegExp(String.raw`\(\s*0\s*,\s*(?:require\s*\(\s*(?:"[^"\r\n]*"|'[^'\r\n]*')\s*\)|[$A-Z_a-z][$\w]*)(?:\s*\.\s*[$A-Z_a-z][$\w]*)*\s*\.\s*(${pluginFactoryNames})\s*\)\s*\(`, "dg");
@@ -186,14 +184,23 @@ export async function captureEntrypoint(entrypoint, options = {}) {
   if (options.mockSdk === true) {
     return captureEntrypointWithMockSdk(entrypoint, options);
   }
+  if (options.isolateCapture === true) {
+    return captureEntrypointInChild(entrypoint, { ...options, mockSdk: false });
+  }
+  return invokeWithTimeout((signal) => captureInProcess(entrypoint, options, signal), options);
+}
 
+async function captureInProcess(entrypoint, options, signal) {
+  signal.throwIfAborted();
   const resolvedEntrypoint = path.resolve(options.cwd ?? process.cwd(), entrypoint);
   let module;
   try {
     module = await import(pathToFileURL(resolvedEntrypoint).href);
   } catch (error) {
+    signal.throwIfAborted();
     throw classifyCapturePhaseError(error, "entrypoint-import-error");
   }
+  signal.throwIfAborted();
   const register = findRegisterExport(module);
 
   if (!register) {
@@ -208,17 +215,17 @@ export async function captureEntrypoint(entrypoint, options = {}) {
     pluginRoot: options.pluginRoot
       ? path.resolve(options.cwd ?? process.cwd(), options.pluginRoot)
       : path.dirname(resolvedEntrypoint),
+    signal,
   });
+  signal.throwIfAborted();
   const api = createCaptureApi(apiOptions);
-  const timeoutMs = resolveCaptureTimeoutMs(options);
   try {
-    await invokeWithTimeout(() => register(api), timeoutMs);
+    await register(api);
   } catch (error) {
-    throw classifyCapturePhaseError(
-      error,
-      error?.failureClass === "capture-timeout" ? "capture-timeout" : "registration-execution-error",
-    );
+    signal.throwIfAborted();
+    throw classifyCapturePhaseError(error, "registration-execution-error");
   }
+  signal.throwIfAborted();
   const result = {
     status: "captured",
     entrypoint: resolvedEntrypoint,
@@ -231,60 +238,68 @@ export async function captureEntrypoint(entrypoint, options = {}) {
 }
 
 export async function captureEntrypointWithMockSdk(entrypoint, options = {}) {
+  return captureEntrypointInChild(entrypoint, { ...options, mockSdk: true });
+}
+
+async function captureEntrypointInChild(entrypoint, options) {
+  const label = options.mockSdk ? "Mock SDK" : "Real SDK";
   const runnerPath = fileURLToPath(new URL("./mock-sdk-capture-runner.js", import.meta.url));
   const payload = {
     entrypoint,
+    mockSdk: options.mockSdk,
     cwd: options.cwd ?? process.cwd(),
     pluginRoot: options.pluginRoot,
     apiOptions: options.apiOptions,
+    maxOutputBytes: options.maxOutputBytes,
   };
+  const { result } = startOwnedProcess({
+    command: process.execPath,
+    args: ["--no-warnings", ...(options.mockSdk ? ["--preserve-symlinks"] : []), runnerPath, JSON.stringify(payload)],
+    cwd: options.cwd ?? process.cwd(),
+    env: { ...process.env, ...options.env },
+    timeoutMs: options.timeoutMs,
+    killGraceMs: options.killGraceMs,
+    maxOutputBytes: options.maxOutputBytes,
+    signal: options.signal,
+  }, "CAPTURE");
+  const outcome = await result;
+  if (outcome.exitCode !== 0 || outcome.outputTruncated) {
+    const message = outcome.cancelled ? `${label} capture cancelled`
+      : outcome.outputTruncated ? `${label} capture output exceeded its byte limit`
+      : `${label} capture child failed`;
+    const { error: childError, ...details } = outcome;
+    throw classifyChildCaptureError(Object.assign(childError ?? new Error(message), details), options.mockSdk);
+  }
   try {
-    const { stdout } = await execFileAsync(
-      process.execPath,
-      ["--no-warnings", "--preserve-symlinks", runnerPath, JSON.stringify(payload)],
-      {
-        cwd: options.cwd ?? process.cwd(),
-        env: {
-          ...process.env,
-          ...(options.env ?? {}),
-        },
-        maxBuffer: 1024 * 1024 * 10,
-      },
-    );
-    return JSON.parse(stdout);
+    return JSON.parse(outcome.stdout);
   } catch (error) {
-    const captured = parseCaptureResultFromStdout(error?.stdout);
-    if (captured) {
-      return captured;
-    }
-    throw classifyMockSdkCaptureError(error);
+    throw classifyChildCaptureError(error, options.mockSdk);
   }
-}
-
-function parseCaptureResultFromStdout(stdout) {
-  if (!stdout) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(stdout);
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      typeof parsed.status === "string" &&
-      Array.isArray(parsed.captured)
-    ) {
-      return parsed;
-    }
-  } catch {
-    return null;
-  }
-  return null;
 }
 
 export function classifyMockSdkCaptureError(error) {
+  return classifyChildCaptureError(error, true);
+}
+
+function classifyChildCaptureError(error, mockSdk) {
+  const label = mockSdk ? "Mock SDK" : "Real SDK";
+  const fallbackClass = mockSdk ? "mock-sdk-capture-error" : "capture-error";
+  if (error?.timedOut === true) {
+    return enrichCaptureError(error, {
+      message: `${label} capture timed out after ${error.timeoutMs}ms`,
+      failureClass: "capture-timeout",
+    });
+  }
+  if (error?.cancelled || error?.outputTruncated) {
+    return enrichCaptureError(error, {
+      message: error.message,
+      failureClass: fallbackClass,
+    });
+  }
+
   const rawMessage = [error?.stderr, error?.stdout, error?.message].filter(Boolean).join("\n");
   const missingExport = rawMessage.match(/does not provide an export named ['"]([^'"]+)['"]/)?.[1];
-  if (missingExport) {
+  if (mockSdk && missingExport) {
     return enrichCaptureError(error, {
       message: `Mock SDK import failed: openclaw/plugin-sdk is missing export ${missingExport}`,
       failureClass: "missing-sdk-export",
@@ -295,9 +310,9 @@ export function classifyMockSdkCaptureError(error) {
   const missingModule =
     rawMessage.match(/Cannot find (?:package|module) ['"]([^'"]*openclaw\/plugin-sdk[^'"]*)['"]/)?.[1] ??
     rawMessage.match(/Package subpath ['"](\.\/plugin-sdk\/[^'"]+)['"]/)?.[1];
-  if (missingModule || rawMessage.includes("openclaw/plugin-sdk")) {
+  if (mockSdk && missingModule) {
     return enrichCaptureError(error, {
-      message: `Mock SDK import failed: ${missingModule ?? "openclaw/plugin-sdk module could not be resolved"}`,
+      message: `Mock SDK import failed: ${missingModule}`,
       failureClass: "missing-sdk-module",
       missingModule,
     });
@@ -306,49 +321,50 @@ export function classifyMockSdkCaptureError(error) {
   const failureClass = rawMessage.match(/\[plugin-inspector:([^\]]+)\]/)?.[1];
   if (failureClass) {
     return enrichCaptureError(error, {
-      message: firstMeaningfulErrorLine(rawMessage.replace(/\[plugin-inspector:[^\]]+\]/, "")) ?? "Mock SDK capture failed",
+      message: firstMeaningfulErrorLine(rawMessage.replace(/\[plugin-inspector:[^\]]+\]/, "")) ?? `${label} capture failed`,
       failureClass,
+    });
+  }
+  if (mockSdk && rawMessage.includes("openclaw/plugin-sdk")) {
+    return enrichCaptureError(error, {
+      message: "Mock SDK import failed: openclaw/plugin-sdk module could not be resolved",
+      failureClass: "missing-sdk-module",
     });
   }
 
   return enrichCaptureError(error, {
-    message: firstMeaningfulErrorLine(rawMessage) ?? "Mock SDK capture failed",
-    failureClass: "mock-sdk-capture-error",
+    message: firstMeaningfulErrorLine(rawMessage) ?? `${label} capture failed`,
+    failureClass: fallbackClass,
   });
 }
 
-export function resolveCaptureTimeoutMs(options = {}) {
-  if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
-    return options.timeoutMs;
-  }
-  const fromEnv = Number.parseInt(
-    String(options.env?.PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS ?? process.env.PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS ?? ""),
-    10,
-  );
-  if (Number.isFinite(fromEnv) && fromEnv > 0) {
-    return fromEnv;
-  }
-  return defaultCaptureTimeoutMs;
-}
-
-function invokeWithTimeout(invoke, timeoutMs) {
-  const run = Promise.resolve().then(invoke);
-  if (!(timeoutMs > 0)) {
-    return run;
-  }
-  let timeoutId;
-  const timeout = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(
-        Object.assign(new Error(`In-process capture timed out after ${timeoutMs}ms`), {
-          failureClass: "capture-timeout",
-        }),
-      );
-    }, timeoutMs);
+function invokeWithTimeout(invoke, options) {
+  const { timeoutMs } = resolveProcessLimits(options, "CAPTURE");
+  const controller = new AbortController();
+  let rejectAborted;
+  const aborted = new Promise((_, reject) => { rejectAborted = reject; });
+  const onAbort = () => rejectAborted(controller.signal.reason);
+  const onCancel = () => controller.abort(classifyCapturePhaseError(
+    new Error("In-process capture cancelled"), "capture-error",
+  ));
+  controller.signal.addEventListener("abort", onAbort, { once: true });
+  const timeoutId = setTimeout(() => controller.abort(classifyCapturePhaseError(
+    new Error(`In-process capture timed out after ${timeoutMs}ms`), "capture-timeout",
+  )), timeoutMs);
+  // Observe late settlement, but stop inspector-owned phases after the deadline.
+  // Arbitrary plugin JavaScript is only preemptable in the supervised CLI child.
+  const run = Promise.resolve().then(() => {
+    controller.signal.throwIfAborted();
+    return invoke(controller.signal);
   });
-  return Promise.race([run, timeout]).finally(() => {
+  const result = Promise.race([run, aborted]).finally(() => {
     clearTimeout(timeoutId);
+    controller.signal.removeEventListener("abort", onAbort);
+    options.signal?.removeEventListener("abort", onCancel);
   });
+  options.signal?.addEventListener("abort", onCancel, { once: true });
+  if (options.signal?.aborted) onCancel();
+  return result;
 }
 
 export function classifyCapturePhaseError(error, failureClass) {
@@ -448,6 +464,16 @@ function collectSdkImports(text, filePath) {
     const line = lineForOffset(text, match.index ?? 0);
     details.push({
       specifier: match[1],
+      file: filePath,
+      line,
+      ref: `${filePath}:${line}`,
+    });
+  }
+  for (const { specifier, index } of collectCommonJsRequires(text)) {
+    if (specifier !== "openclaw/plugin-sdk" && !specifier.startsWith("openclaw/plugin-sdk/")) continue;
+    const line = lineForOffset(text, index);
+    details.push({
+      specifier,
       file: filePath,
       line,
       ref: `${filePath}:${line}`,
