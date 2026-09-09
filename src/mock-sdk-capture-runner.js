@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { rmSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
-import { register } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -9,7 +8,7 @@ import { writeArtifacts } from "./artifacts.js";
 import { createCaptureApi } from "./capture-api.js";
 import { captureApiOptionsForPlugin } from "./capture-config.js";
 import { createCappedCollector, resolveProcessLimits } from "./process-profile.js";
-import { createMockSdkPackage } from "./sdk-mock.js";
+import { createMockSdkPackage, installMockSdkLoader } from "./sdk-mock.js";
 
 const options = JSON.parse(process.argv[2] ?? "{}");
 let activeOutputCapture = null;
@@ -41,9 +40,13 @@ async function run(options) {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-mock-sdk-"));
 
   cleanupTempDirOnExit(workspace);
-  const { loaderPath } = await createMockSdkPackage(workspace, { pluginRoot });
-  register(pathToFileURL(loaderPath));
-  return await captureLinkedEntrypoint(entrypoint, { ...options, pluginRoot });
+  const mockPackage = await createMockSdkPackage(workspace, { pluginRoot });
+  const stopLoader = await installMockSdkLoader(mockPackage);
+  try {
+    return await captureLinkedEntrypoint(entrypoint, { ...options, pluginRoot });
+  } finally {
+    stopLoader();
+  }
 }
 
 function cleanupTempDirOnExit(dir) {
