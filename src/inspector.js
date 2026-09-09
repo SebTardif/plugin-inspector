@@ -1,5 +1,4 @@
 import { existsSync } from "node:fs";
-import { spawn } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
 import * as nodeModule from "node:module";
 import path from "node:path";
@@ -10,14 +9,13 @@ import { fixtureCheckoutPath, fixtureSourceRoot } from "./config.js";
 import { buildCompatibilityFixtureReport } from "./fixture-summary.js";
 import { readOpenClawTargetSurface } from "./openclaw-target.js";
 import { prepareOpenClawTarget, resolveOpenClawTargetVersion } from "./openclaw-version.js";
+import { startOwnedProcess } from "./process-profile.js";
 import { buildCompatibilityReport, buildReport } from "./report.js";
 import { inspectSdkDeprecations } from "./sdk-deprecation-rules.js";
 
 const pluginFactoryNames = "defineBundledChannelEntry|defineChannelPluginEntry|createChatChannelPlugin|definePluginEntry";
 // Bundlers emit unbound calls as (0, sdk.factory)(...), including inline require receivers.
 const compiledFactoryCall = new RegExp(String.raw`\(\s*0\s*,\s*(?:require\s*\(\s*(?:"[^"\r\n]*"|'[^'\r\n]*')\s*\)|[$A-Z_a-z][$\w]*)(?:\s*\.\s*[$A-Z_a-z][$\w]*)*\s*\.\s*(${pluginFactoryNames})\s*\)\s*\(`, "dg");
-export const defaultCaptureTimeoutMs = 30_000;
-export const defaultCaptureKillGraceMs = 1_000;
 const registrationEquivalents = new Map([
   ["registerChannel", new Set(["createChatChannelPlugin", "defineBundledChannelEntry", "defineChannelPluginEntry", "registerChannel"])],
 ]);
@@ -232,175 +230,44 @@ export async function captureEntrypointWithMockSdk(entrypoint, options = {}) {
     cwd: options.cwd ?? process.cwd(),
     pluginRoot: options.pluginRoot,
     apiOptions: options.apiOptions,
+    maxOutputBytes: options.maxOutputBytes,
   };
-  const timeoutMs = resolveCaptureTimeoutMs(options);
-  const killGraceMs = resolveCaptureKillGraceMs(options);
+  const { result } = startOwnedProcess({
+    command: process.execPath,
+    args: ["--no-warnings", "--preserve-symlinks", runnerPath, JSON.stringify(payload)],
+    cwd: options.cwd ?? process.cwd(),
+    env: { ...process.env, ...options.env },
+    timeoutMs: options.timeoutMs,
+    killGraceMs: options.killGraceMs,
+    maxOutputBytes: options.maxOutputBytes,
+    signal: options.signal,
+  }, "CAPTURE");
+  const outcome = await result;
+  if (outcome.exitCode !== 0 || outcome.outputTruncated) {
+    const message = outcome.cancelled ? "Mock SDK capture cancelled"
+      : outcome.outputTruncated ? "Mock SDK capture output exceeded its byte limit"
+      : "Mock SDK capture child failed";
+    const { error: childError, ...details } = outcome;
+    throw classifyMockSdkCaptureError(Object.assign(childError ?? new Error(message), details));
+  }
   try {
-    const { stdout } = await runMockSdkCaptureChild({
-      runnerPath,
-      payload,
-      cwd: options.cwd ?? process.cwd(),
-      env: {
-        ...process.env,
-        ...(options.env ?? {}),
-      },
-      timeoutMs,
-      killGraceMs,
-      maxBuffer: 1024 * 1024 * 10,
-    });
-    return JSON.parse(stdout);
+    return JSON.parse(outcome.stdout);
   } catch (error) {
-    error.timeoutMs = timeoutMs;
-    const captured = parseCaptureResultFromStdout(error?.stdout);
-    if (captured && !isChildTimeoutError(error)) {
-      return captured;
-    }
     throw classifyMockSdkCaptureError(error);
   }
 }
 
-export function resolveCaptureTimeoutMs(options = {}) {
-  if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
-    return options.timeoutMs;
-  }
-  const fromEnv = Number.parseInt(String(options.env?.PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS ?? process.env.PLUGIN_INSPECTOR_CAPTURE_TIMEOUT_MS ?? ""), 10);
-  if (Number.isFinite(fromEnv) && fromEnv > 0) {
-    return fromEnv;
-  }
-  return defaultCaptureTimeoutMs;
-}
-
-export function resolveCaptureKillGraceMs(options = {}) {
-  if (Number.isFinite(options.killGraceMs) && options.killGraceMs >= 0) {
-    return options.killGraceMs;
-  }
-  const fromEnv = Number.parseInt(
-    String(options.env?.PLUGIN_INSPECTOR_CAPTURE_KILL_GRACE_MS ?? process.env.PLUGIN_INSPECTOR_CAPTURE_KILL_GRACE_MS ?? ""),
-    10,
-  );
-  if (Number.isFinite(fromEnv) && fromEnv >= 0) {
-    return fromEnv;
-  }
-  return defaultCaptureKillGraceMs;
-}
-
-function runMockSdkCaptureChild({ runnerPath, payload, cwd, env, timeoutMs, killGraceMs, maxBuffer }) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      process.execPath,
-      ["--no-warnings", "--preserve-symlinks", runnerPath, JSON.stringify(payload)],
-      { cwd, env, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    const stdoutChunks = [];
-    const stderrChunks = [];
-    let stdoutBytes = 0;
-    let settled = false;
-    let timedOut = false;
-    let timeoutId;
-    let forceKillId;
-
-    const finish = (err, result) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (timeoutId !== undefined) {
-        clearTimeout(timeoutId);
-      }
-      if (forceKillId !== undefined) {
-        clearTimeout(forceKillId);
-      }
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve(result);
-    };
-
-    child.stdout?.on("data", (chunk) => {
-      stdoutBytes += chunk.length;
-      if (stdoutBytes <= maxBuffer) {
-        stdoutChunks.push(chunk);
-      }
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderrChunks.push(chunk);
-    });
-    child.on("error", (error) => finish(error));
-    child.on("exit", (code, signal) => {
-      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
-      const stderr = Buffer.concat(stderrChunks).toString("utf8");
-      if (timedOut) {
-        finish(
-          Object.assign(new Error("Command failed: node mock-sdk-capture-runner.js"), {
-            killed: true,
-            signal: signal ?? "SIGKILL",
-            code,
-            stdout,
-            stderr,
-          }),
-        );
-        return;
-      }
-      if (code === 0) {
-        finish(null, { stdout, stderr });
-        return;
-      }
-      finish(
-        Object.assign(new Error("Command failed: node mock-sdk-capture-runner.js"), {
-          killed: false,
-          signal,
-          code,
-          stdout,
-          stderr,
-        }),
-      );
-    });
-
-    if (timeoutMs > 0) {
-      timeoutId = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGTERM");
-        forceKillId = setTimeout(() => {
-          if (child.exitCode === null && child.signalCode === null) {
-            child.kill("SIGKILL");
-          }
-        }, killGraceMs);
-      }, timeoutMs);
-    }
-  });
-}
-
-export function isChildTimeoutError(error) {
-  return error?.killed === true && (error.signal === "SIGTERM" || error.signal === "SIGKILL");
-}
-
-function parseCaptureResultFromStdout(stdout) {
-  if (!stdout) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(stdout);
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      typeof parsed.status === "string" &&
-      Array.isArray(parsed.captured)
-    ) {
-      return parsed;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
 export function classifyMockSdkCaptureError(error) {
-  if (isChildTimeoutError(error)) {
-    const timeoutMs = Number.isFinite(error?.timeoutMs) ? error.timeoutMs : defaultCaptureTimeoutMs;
+  if (error?.timedOut === true) {
     return enrichCaptureError(error, {
-      message: `Mock SDK capture timed out after ${timeoutMs}ms`,
+      message: `Mock SDK capture timed out after ${error.timeoutMs}ms`,
       failureClass: "capture-timeout",
+    });
+  }
+  if (error?.cancelled || error?.outputTruncated) {
+    return enrichCaptureError(error, {
+      message: error.message,
+      failureClass: "mock-sdk-capture-error",
     });
   }
 

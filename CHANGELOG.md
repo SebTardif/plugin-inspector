@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Bound mock-SDK capture and profile child lifetimes, output, and process sampling; clean owned POSIX descendants through stdio close and keep timeout/cancellation outcomes unsuccessful. Flush complete capture JSON before exiting despite retained plugin timers. Thanks @SebTardif.
+- Profile the default import-loop capture runner directly so its timeout also owns plugin execution. Validate fresh, bounded capture artifacts; RSS/CPU and wall-time measurements now exclude the intermediate CLI wrapper and are not directly comparable with historical profiles.
+
 ## 0.3.24 - 2026-08-31
 
 ### Fixed

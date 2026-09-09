@@ -1,8 +1,146 @@
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
-export const defaultProfileTimeoutMs = 30_000;
-export const defaultProfileMaxOutputBytes = 1024 * 1024;
+const defaultTimeoutMs = 30_000;
+const defaultKillGraceMs = 1_000;
+const maxTimerMs = 2 ** 31 - 1;
+const killWaitMs = 1_000;
+
+// Shared by capture and profiling, not a package entrypoint. Each spawn owns
+// its POSIX process group; never signal the inspector's inherited group.
+export function startOwnedProcess(options, kind = "PROFILE") {
+  const env = options.env ?? process.env;
+  const { timeoutMs, killGraceMs, maxOutputBytes } = resolveProcessLimits(options, kind);
+  const stdout = createCappedCollector(maxOutputBytes);
+  const stderr = createCappedCollector(maxOutputBytes);
+  let timedOut = false;
+  let cancelled = options.signal?.aborted === true;
+  let error;
+  let closed = false;
+  let stopping = false;
+  let escalated = false;
+  let settled = false;
+  let code;
+  let exitSignal;
+  let timeoutId;
+  let forceKillId;
+  let closeDeadlineId;
+  let child;
+  let resolveResult;
+  const result = new Promise((resolve) => { resolveResult = resolve; });
+
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutId);
+    clearTimeout(forceKillId);
+    clearTimeout(closeDeadlineId);
+    options.signal?.removeEventListener("abort", cancel);
+    resolveResult({
+      exitCode: timedOut || cancelled || error ? 1 : (code ?? 1),
+      timedOut,
+      cancelled,
+      timeoutMs,
+      signal: exitSignal,
+      pid: child?.pid,
+      error,
+      stdout: stdout.text(),
+      stderr: stderr.text(),
+      outputTruncated: stdout.truncated || stderr.truncated,
+    });
+  };
+  const groupExists = () => {
+    if (!child?.pid) return false;
+    if (process.platform === "win32") return child.exitCode === null && child.signalCode === null;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (cause) {
+      if (cause.code === "ESRCH") return false;
+      error ??= cause;
+      return true;
+    }
+  };
+  const signalGroup = (signal) => {
+    if (!child?.pid) return;
+    try {
+      if (process.platform === "win32") child.kill(signal);
+      else process.kill(-child.pid, signal);
+    } catch (cause) {
+      if (cause.code !== "ESRCH") error ??= cause;
+    }
+  };
+  const stop = () => {
+    if (stopping || settled) return;
+    stopping = true;
+    signalGroup("SIGTERM");
+    forceKillId = setTimeout(() => {
+      // The leader may already be reaped while its descendants hold the pipes.
+      signalGroup("SIGKILL");
+      escalated = true;
+      if (closed) {
+        finish();
+        return;
+      }
+      closeDeadlineId = setTimeout(() => {
+        error ??= new Error("Owned child stdio did not close after SIGKILL");
+        child?.stdout?.destroy();
+        child?.stderr?.destroy();
+        child?.stdin?.destroy();
+        child?.unref();
+        finish();
+      }, killWaitMs);
+    }, killGraceMs);
+  };
+  const cancel = () => {
+    cancelled = true;
+    stop();
+  };
+
+  if (cancelled) {
+    finish();
+    return { child, result };
+  }
+  try {
+    child = spawn(options.command, options.args ?? [], {
+      cwd: options.cwd,
+      env,
+      detached: process.platform !== "win32",
+      stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
+    });
+  } catch (cause) {
+    error = cause;
+    finish();
+    return { child, result };
+  }
+  child.stdout?.on("data", (chunk) => stdout.push(chunk));
+  child.stderr?.on("data", (chunk) => stderr.push(chunk));
+  const fail = (cause) => {
+    error ??= cause;
+    stop();
+  };
+  child.stdout?.on("error", fail);
+  child.stderr?.on("error", fail);
+  child.once("error", fail);
+  child.once("exit", () => {
+    // Clean descendants even after a successful leader exit or closed pipes.
+    if (groupExists()) stop();
+  });
+  child.once("close", (exitCode, signal) => {
+    closed = true;
+    code = exitCode;
+    exitSignal = signal;
+    if (!escalated && groupExists()) stop();
+    else finish();
+  });
+  timeoutId = setTimeout(() => {
+    timedOut = true;
+    stop();
+  }, timeoutMs);
+  options.signal?.addEventListener("abort", cancel, { once: true });
+  if (options.signal?.aborted) cancel();
+  return { child, result };
+}
 
 export async function runProfiledProcess(options) {
   const start = performance.now();
@@ -13,120 +151,50 @@ export async function runProfiledProcess(options) {
   let statSampleCount = 0;
   let rssSampleCount = 0;
   let cpuSampleCount = 0;
-  const cpuSamples = [];
-  let pollInFlight = false;
-  const pendingStats = new Set();
-  const timeoutMs = resolveProfileTimeoutMs(options);
-  const maxOutputBytes = resolveProfileMaxOutputBytes(options);
-  let timedOut = false;
-  let poll;
-  let timeoutId;
-  let forceKillId;
-
-  const child = spawn(options.command, options.args ?? [], {
-    cwd: options.cwd,
-    env: options.env,
-    stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
-  });
-  const stdout = createCappedCollector(maxOutputBytes);
-  const stderr = createCappedCollector(maxOutputBytes);
-  child.stdout?.on("data", (chunk) => stdout.push(chunk));
-  child.stderr?.on("data", (chunk) => stderr.push(chunk));
-
-  const recordStats = (stats) => {
-    if (stats.rssAvailable || stats.cpuAvailable) {
-      statSampleCount += 1;
-    }
-    if (stats.rssAvailable) {
-      rssSampleCount += 1;
-    }
-    if (stats.cpuAvailable) {
-      cpuSampleCount += 1;
-    }
-    if (stats.rssAvailable && stats.rssKb > 0 && firstRssKb === 0) {
-      firstRssKb = stats.rssKb;
-    }
-    if (stats.rssAvailable) {
-      peakRssKb = Math.max(peakRssKb, stats.rssKb);
-    }
-    if (stats.cpuAvailable) {
-      peakCpuPercent = Math.max(peakCpuPercent, stats.cpuPercent);
-      cpuSamples.push(stats.cpuPercent);
-    }
-  };
-
+  let cpuTotal = 0;
+  let pendingStats;
+  let stopped = false;
+  const statsController = new AbortController();
+  const running = startOwnedProcess(options);
   const sampleStats = () => {
-    if (pollInFlight) {
-      return;
-    }
-    pollInFlight = true;
-    const pending = readProcessStats(child.pid)
-      .then(recordStats)
-      .finally(() => {
-        pollInFlight = false;
-        pendingStats.delete(pending);
-      });
-    pendingStats.add(pending);
+    if (pendingStats || stopped || !running.child?.pid) return;
+    pendingStats = readProcessStats(running.child.pid, options.env, statsController.signal)
+      .then((stats) => {
+        if (stopped) return;
+        if (stats.rssAvailable || stats.cpuAvailable) statSampleCount += 1;
+        if (stats.rssAvailable) {
+          rssSampleCount += 1;
+          if (stats.rssKb > 0 && firstRssKb === 0) firstRssKb = stats.rssKb;
+          peakRssKb = Math.max(peakRssKb, stats.rssKb);
+        }
+        if (stats.cpuAvailable) {
+          cpuSampleCount += 1;
+          peakCpuPercent = Math.max(peakCpuPercent, stats.cpuPercent);
+          cpuTotal += stats.cpuPercent;
+        }
+      })
+      .finally(() => { pendingStats = undefined; });
   };
-
-  const stopWatching = () => {
-    if (poll !== undefined) {
-      clearInterval(poll);
-      poll = undefined;
-    }
-    if (timeoutId !== undefined) {
-      clearTimeout(timeoutId);
-      timeoutId = undefined;
-    }
-    if (forceKillId !== undefined) {
-      clearTimeout(forceKillId);
-      forceKillId = undefined;
-    }
+  const poll = setInterval(sampleStats, positiveLimit(options.pollMs, undefined, 25));
+  const stopSampling = () => {
+    stopped = true;
+    clearInterval(poll);
+    statsController.abort();
   };
-
+  running.child?.once("exit", stopSampling);
+  running.child?.once("error", stopSampling);
   sampleStats();
-  poll = setInterval(sampleStats, options.pollMs ?? 25);
 
   try {
-    const exitCode = await new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (fn) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        stopWatching();
-        fn();
-      };
-      child.on("error", (error) => finish(() => reject(error)));
-      child.on("exit", (code) => finish(() => resolve(code ?? 1)));
-      if (timeoutMs > 0) {
-        timeoutId = setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGTERM");
-          forceKillId = setTimeout(() => {
-            if (child.exitCode === null && child.signalCode === null) {
-              child.kill("SIGKILL");
-            }
-          }, options.killGraceMs ?? 1000);
-        }, timeoutMs);
-      }
-    });
-    await Promise.allSettled([...pendingStats]);
-
-    const finalStats = await readProcessStats(child.pid);
-    recordStats(finalStats);
-
+    const outcome = await running.result;
+    stopSampling();
+    await pendingStats;
+    if (outcome.error) throw outcome.error;
     const wallMs = Math.round(performance.now() - start);
-    const averageCpuPercent =
-      cpuSamples.length > 0
-        ? cpuSamples.reduce((sum, value) => sum + value, 0) / cpuSamples.length
-        : 0;
-    const cpuPercentForEstimate =
-      options.roundAverageCpuPercent === true
-        ? Math.round(averageCpuPercent * 10) / 10
-        : averageCpuPercent;
-
+    const averageCpuPercent = cpuSampleCount > 0 ? cpuTotal / cpuSampleCount : 0;
+    const cpuPercentForEstimate = options.roundAverageCpuPercent === true
+      ? Math.round(averageCpuPercent * 10) / 10
+      : averageCpuPercent;
     return {
       wallMs,
       peakRssMb: Math.round((peakRssKb / 1024) * 10) / 10,
@@ -137,83 +205,82 @@ export async function runProfiledProcess(options) {
       statSampleCount,
       rssSampleCount,
       cpuSampleCount,
-      exitCode,
-      timedOut,
-      pid: child.pid,
-      stdoutPreview: previewLines(stdout.chunks),
-      stderrPreview: previewLines(stderr.chunks),
+      exitCode: outcome.exitCode,
+      timedOut: outcome.timedOut,
+      cancelled: outcome.cancelled,
+      pid: outcome.pid,
+      stdoutPreview: previewLines(outcome.stdout),
+      stderrPreview: previewLines(outcome.stderr),
     };
   } finally {
-    stopWatching();
+    stopSampling();
   }
 }
 
-export function resolveProfileTimeoutMs(options = {}) {
-  if (Number.isFinite(options.timeoutMs) && options.timeoutMs >= 0) {
-    return options.timeoutMs;
-  }
-  const fromEnv = Number.parseInt(String(options.env?.PLUGIN_INSPECTOR_PROFILE_TIMEOUT_MS ?? process.env.PLUGIN_INSPECTOR_PROFILE_TIMEOUT_MS ?? ""), 10);
-  if (Number.isFinite(fromEnv) && fromEnv >= 0) {
-    return fromEnv;
-  }
-  return defaultProfileTimeoutMs;
-}
-
-export function resolveProfileMaxOutputBytes(options = {}) {
-  if (Number.isFinite(options.maxOutputBytes) && options.maxOutputBytes >= 0) {
-    return options.maxOutputBytes;
-  }
-  return defaultProfileMaxOutputBytes;
-}
-
-function createCappedCollector(maxBytes) {
-  const chunks = [];
-  let size = 0;
+export function resolveProcessLimits(options, kind = "PROFILE") {
+  const env = options.env ?? process.env;
+  const setting = (name) => env[`PLUGIN_INSPECTOR_${kind}_${name}`] ?? process.env[`PLUGIN_INSPECTOR_${kind}_${name}`];
   return {
-    chunks,
-    push(chunk) {
-      if (size >= maxBytes) {
-        return;
-      }
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      const room = maxBytes - size;
-      chunks.push(buffer.length > room ? buffer.subarray(0, room) : buffer);
-      size += Math.min(buffer.length, room);
-    },
+    timeoutMs: positiveLimit(options.timeoutMs, setting("TIMEOUT_MS"), defaultTimeoutMs),
+    killGraceMs: positiveLimit(options.killGraceMs, setting("KILL_GRACE_MS"), defaultKillGraceMs, 30_000),
+    maxOutputBytes: positiveLimit(options.maxOutputBytes, setting("MAX_OUTPUT_BYTES"), (kind === "CAPTURE" ? 10 : 1) * 1024 * 1024),
   };
 }
 
-async function readProcessStats(pid) {
-  if (!pid || process.platform === "win32") {
-    return { rssAvailable: false, rssKb: 0, cpuAvailable: false, cpuPercent: 0 };
-  }
-  return new Promise((resolve) => {
-    const ps = spawn("ps", ["-o", "rss=", "-o", "%cpu=", "-p", String(pid)], {
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const chunks = [];
-    ps.stdout.on("data", (chunk) => chunks.push(chunk));
-    ps.on("error", () => resolve({ rssAvailable: false, rssKb: 0, cpuAvailable: false, cpuPercent: 0 }));
-    ps.on("exit", () => {
-      const [rssRaw, cpuRaw] = Buffer.concat(chunks).toString("utf8").trim().split(/\s+/);
-      const rssKb = Number.parseInt(rssRaw, 10);
-      const cpuPercent = Number.parseFloat(cpuRaw);
-      const rssAvailable = Number.isFinite(rssKb);
-      const cpuAvailable = Number.isFinite(cpuPercent);
-      resolve({
-        rssAvailable,
-        rssKb: rssAvailable ? rssKb : 0,
-        cpuAvailable,
-        cpuPercent: cpuAvailable ? cpuPercent : 0,
-      });
-    });
+function positiveLimit(option, env, fallback, max = maxTimerMs) {
+  const valid = (value) => Number.isFinite(value) && value > 0 && value <= max;
+  if (valid(option)) return Math.ceil(option);
+  const fromEnv = typeof env === "string" ? Number(env) : NaN;
+  return valid(fromEnv) ? Math.ceil(fromEnv) : fallback;
+}
+
+export function createCappedCollector(maxBytes) {
+  const chunks = [];
+  let size = 0;
+  let truncated = false;
+  return {
+    get truncated() { return truncated; },
+    push(chunk) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const length = Math.min(buffer.length, maxBytes - size);
+      if (length < buffer.length) truncated = true;
+      if (length === 0) return;
+      chunks.push(Buffer.from(buffer.subarray(0, length)));
+      size += length;
+    },
+    text: () => Buffer.concat(chunks, size).toString("utf8"),
+  };
+}
+
+async function readProcessStats(pid, env, signal) {
+  const unavailable = { rssAvailable: false, rssKb: 0, cpuAvailable: false, cpuPercent: 0 };
+  if (!pid || process.platform === "win32") return unavailable;
+  const { result } = startOwnedProcess({
+    command: "ps",
+    args: ["-o", "rss=", "-o", "%cpu=", "-p", String(pid)],
+    env,
+    signal,
+    timeoutMs: 250,
+    killGraceMs: 50,
+    maxOutputBytes: 4096,
   });
+  const outcome = await result;
+  if (outcome.exitCode !== 0 || outcome.outputTruncated) return unavailable;
+  const [rssRaw, cpuRaw] = outcome.stdout.trim().split(/\s+/);
+  const rssKb = Number.parseInt(rssRaw, 10);
+  const cpuPercent = Number.parseFloat(cpuRaw);
+  return {
+    rssAvailable: Number.isFinite(rssKb),
+    rssKb: Number.isFinite(rssKb) ? rssKb : 0,
+    cpuAvailable: Number.isFinite(cpuPercent),
+    cpuPercent: Number.isFinite(cpuPercent) ? cpuPercent : 0,
+  };
 }
 
 function heapUsedMb() {
   return Math.round((process.memoryUsage().heapUsed / 1024 / 1024) * 10) / 10;
 }
 
-function previewLines(chunks) {
-  return Buffer.concat(chunks).toString("utf8").trim().split("\n").slice(-2).join("\n");
+function previewLines(text) {
+  return text.trim().split("\n").slice(-2).join("\n");
 }

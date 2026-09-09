@@ -336,6 +336,7 @@ async function profileCommand(command, options) {
     timeoutMs: command.timeoutMs ?? options.timeoutMs,
     maxOutputBytes: command.maxOutputBytes ?? options.maxOutputBytes,
     killGraceMs: command.killGraceMs ?? options.killGraceMs,
+    signal: options.signal,
   });
 }
 
