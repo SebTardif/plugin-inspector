@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { captureEntrypoint, inspectFixtureSet, inspectSourceText, loadInspectorConfig } from "../src/advanced.js";
+import { captureEntrypoint, classifyTargetOpenClawCoverage, inspectFixtureSet, inspectSourceText, loadInspectorConfig } from "../src/advanced.js";
 
 test("source inspection records hooks and registrars without treating type-only SDK imports as runtime imports", () => {
   const inspection = inspectSourceText(
@@ -144,6 +144,88 @@ test("source inspection separates compact runtime imports from TypeScript import
       "openclaw/plugin-sdk/semicolonless@plugins/example/index.ts:9",
     ],
   );
+});
+
+test("source inspection discovers literal runtime imports without importing promise or quoted expressions", () => {
+  const source = [
+    'type Shape = import("openclaw/plugin-sdk/shared").Shape;',
+    'const { sharedHelper: aliased } = await import("openclaw/plugin-sdk/shared");',
+    'const sdk = await import(`openclaw/plugin-sdk/namespace`); sdk.namespaceHelper;',
+    'const direct = (await import("openclaw/plugin-sdk/direct")).directHelper;',
+    'const load = () => import("openclaw/plugin-sdk/promise").then(() => {});',
+    '// import("openclaw/plugin-sdk/comment");',
+    '/* import("openclaw/plugin-sdk/block-comment"); */',
+    'const text = \'import("openclaw/plugin-sdk/string")\';',
+    'const template = `https://fixture.invalid import("openclaw/plugin-sdk/template-text") ${',
+    '  `nested ${typeof (await import("openclaw/plugin-sdk/template-expression")).templateHelper}`',
+    '}`;',
+    'const computed = (name) => import(`openclaw/plugin-sdk/${name}`);',
+    'const joined = (name) => import("openclaw/plugin-sdk/" + name);',
+    'const property = receiver.import("openclaw/plugin-sdk/property");',
+    'const required = require("openclaw/plugin-sdk/required");',
+  ].join("\n");
+  assert.deepEqual(
+    inspectSourceText(source, "fixture.ts").sdkImports.map(({ specifier, ref }) => [specifier, ref]),
+    [
+      ["openclaw/plugin-sdk/shared", "fixture.ts:2"],
+      ["openclaw/plugin-sdk/namespace", "fixture.ts:3"],
+      ["openclaw/plugin-sdk/direct", "fixture.ts:4"],
+      ["openclaw/plugin-sdk/promise", "fixture.ts:5"],
+      ["openclaw/plugin-sdk/template-expression", "fixture.ts:10"],
+      ["openclaw/plugin-sdk/required", "fixture.ts:15"],
+    ],
+  );
+});
+
+test("source inspection retains dynamic imports conservatively when TypeScript cannot be erased", () => {
+  const source = 'type Shape = import("openclaw/plugin-sdk/uncertain").Shape; const incomplete =';
+  assert.deepEqual(inspectSourceText(source).sdkImports.map(({ specifier }) => specifier),
+    ["openclaw/plugin-sdk/uncertain"]);
+});
+
+test("source compatibility findings retain imports with options, trailing commas, and comments", () => {
+  const source = [
+    'type Only = import("openclaw/plugin-sdk/options").Only;',
+    'const options = import("openclaw/plugin-sdk/options", {});',
+    'const comma = import("openclaw/plugin-sdk/comma",);',
+    'const comment = import("openclaw/plugin-sdk/comment" /* trailing comment */);',
+  ].join("\n");
+  const sdkImportDetails = inspectSourceText(source, "fixture.ts").sdkImports;
+  assert.deepEqual(sdkImportDetails.map(({ specifier, ref }) => [specifier, ref]), [
+    ["openclaw/plugin-sdk/options", "fixture.ts:2"],
+    ["openclaw/plugin-sdk/comma", "fixture.ts:3"],
+    ["openclaw/plugin-sdk/comment", "fixture.ts:4"],
+  ]);
+  const result = classifyTargetOpenClawCoverage({
+    fixture: { id: "fixture" },
+    inspection: { hooks: [], hookDetails: [], registrationDetails: [] },
+    fixtureReport: { sdkImports: sdkImportDetails.map(({ specifier }) => specifier), sdkImportDetails },
+    targetOpenClaw: {
+      status: "ok", hookNames: [], apiRegistrars: [], manifestFields: [], sdkExports: ["openclaw/plugin-sdk"],
+    },
+  });
+  assert.deepEqual(result.warnings.find(({ code }) => code === "sdk-export-missing")?.evidence, [
+    "openclaw/plugin-sdk/options @ fixture.ts:2",
+    "openclaw/plugin-sdk/comma @ fixture.ts:3",
+    "openclaw/plugin-sdk/comment @ fixture.ts:4",
+  ]);
+});
+
+test("source inspection finds imports after quoted regexes at their original location", () => {
+  const source = [
+    `const quote = /["']/;`,
+    'const fake = /require("demo")/;',
+    'const sdk = await import("openclaw/plugin-sdk/after-regex");',
+  ].join("\n");
+  assert.deepEqual(inspectSourceText(source, "fixture.js").sdkImports, [
+    { specifier: "openclaw/plugin-sdk/after-regex", file: "fixture.js", line: 3, ref: "fixture.js:3" },
+  ]);
+});
+
+test("source inspection preserves erased import types when runtime AST analysis fails", () => {
+  const source = 'type Only = import("openclaw/plugin-sdk/type-only").Only; const sdk = await import("openclaw/plugin-sdk/retained"); const sdk = 0;';
+  assert.deepEqual(inspectSourceText(source).sdkImports.map(({ specifier }) => specifier),
+    ["openclaw/plugin-sdk/retained"]);
 });
 
 test("source inspection strips long comments before matching registrations", () => {
