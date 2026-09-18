@@ -11,6 +11,7 @@ export function isUncPath(value) {
   return /^\/\/[^/]+/u.test(value.replaceAll("\\", "/"));
 }
 
+// Lexical string check only. Does not follow or reject symlinks or Windows junctions.
 export function isWithinPluginRoot(rootDir, candidatePath) {
   const root = path.resolve(rootDir);
   const candidate = path.resolve(candidatePath);
