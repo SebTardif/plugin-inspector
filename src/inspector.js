@@ -34,7 +34,10 @@ export async function inspectCompatibilityFixtureSet(config, options = {}) {
     (options.openclawVersion
       ? await prepareOpenClawTarget(await resolveOpenClawTargetVersion(options.openclawVersion, options), options)
       : await readOpenClawTargetSurface({
-          configuredPath: options.openclawPath,
+          configuredPath:
+            options.openclawPath === false
+              ? false
+              : options.openclawPath ?? config.openclaw?.defaultCheckoutPath,
           manifest: config,
           rootDir: config.rootDir,
         }));

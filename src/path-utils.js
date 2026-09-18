@@ -18,7 +18,19 @@ export function isWithinPluginRoot(rootDir, candidatePath) {
     return false;
   }
   const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative === "" || (!isParentDirectoryRelative(relative) && !path.isAbsolute(relative));
+}
+
+export function isParentDirectoryRelative(relative) {
+  if (typeof relative !== "string" || relative.length === 0) {
+    return false;
+  }
+  return (
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    relative.startsWith("../") ||
+    relative.startsWith("..\\")
+  );
 }
 
 export function resolveJailedPluginPath(rootDir, specifier) {

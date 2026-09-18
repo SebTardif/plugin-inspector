@@ -14,6 +14,14 @@ export async function readOpenClawTargetSurface(options = {}) {
   }
 
   const requestedPaths = openClawTargetPathCandidates(options.manifest, configuredPath, { rootDir });
+  const rejectedCheckoutPath = rejectedPluginCheckoutPath(options.manifest, configuredPath, { rootDir });
+  if (rejectedCheckoutPath) {
+    return emptyTargetSurface({
+      configuredPath: rejectedCheckoutPath,
+      searchedPaths: [rejectedCheckoutPath],
+      status: "rejected",
+    });
+  }
   if (requestedPaths.length === 0) {
     return emptyTargetSurface({ configuredPath: null, status: "not-configured" });
   }
@@ -120,11 +128,21 @@ export function openClawTargetPathCandidates(manifest, configuredPath, options =
     return isUncPath(configuredPath) ? [] : [configuredPath];
   }
   const pluginPath = manifest?.openclaw?.defaultCheckoutPath;
-  const allowedPluginPath =
-    typeof pluginPath === "string" && options.rootDir
-      ? (resolveJailedPluginPath(options.rootDir, pluginPath) ? pluginPath : null)
-      : pluginPath;
-  return unique([allowedPluginPath, ...defaultOpenClawCheckoutPaths].filter(Boolean));
+  if (rejectedPluginCheckoutPath(manifest, configuredPath, options)) {
+    return [];
+  }
+  return unique([pluginPath, ...defaultOpenClawCheckoutPaths].filter(Boolean));
+}
+
+function rejectedPluginCheckoutPath(manifest, configuredPath, options = {}) {
+  if (typeof configuredPath === "string" || configuredPath === false) {
+    return null;
+  }
+  const pluginPath = manifest?.openclaw?.defaultCheckoutPath;
+  if (typeof pluginPath !== "string" || !options.rootDir) {
+    return null;
+  }
+  return resolveJailedPluginPath(options.rootDir, pluginPath) ? null : pluginPath;
 }
 
 export function parseCompatRecordEntries(source) {

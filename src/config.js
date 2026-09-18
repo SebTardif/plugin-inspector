@@ -124,7 +124,13 @@ export function fixtureCheckoutPath(config, fixture) {
 export function fixtureSourceRoot(config, fixture) {
   const checkoutPath = fixtureCheckoutPath(config, fixture);
   if (fixture.subdir) {
-    return resolveJailedPluginPath(checkoutPath, fixture.subdir) ?? checkoutPath;
+    const jailed = resolveJailedPluginPath(checkoutPath, fixture.subdir);
+    if (!jailed) {
+      throw new Error(
+        `sourceRoot ${JSON.stringify(fixture.subdir)} is outside the plugin root; refuse to scan a replacement tree`,
+      );
+    }
+    return jailed;
   }
   if (fixture.package) {
     return path.join(checkoutPath, npmPackagePayloadDir);

@@ -35,6 +35,13 @@ test("resolveJailedPluginPath rejects ../, Windows absolute, and UNC specifiers 
   const accepted = resolveJailedPluginPath(root, "src/index.js");
   assert.ok(accepted);
   assert.equal(path.relative(path.resolve(root), accepted).split(path.sep).join("/"), "src/index.js");
+
+  const dottedName = resolveJailedPluginPath(root, "..generated/index.js");
+  assert.ok(dottedName);
+  assert.equal(
+    path.relative(path.resolve(root), dottedName).split(path.sep).join("/"),
+    "..generated/index.js",
+  );
 });
 
 test("inspect rejects a relative ../ entrypoint escape and still accepts src/index.js", async (t) => {
@@ -148,13 +155,14 @@ test("config sourceRoot cannot escape the plugin root via ../ or a Windows absol
   });
 
   const config = await loadPluginRootConfig(null, { cwd: pluginRoot });
-  const sourceRoot = fixtureSourceRoot(config, config.fixtures[0]);
-  assertInside(pluginRoot, sourceRoot);
-  assert.notEqual(path.resolve(sourceRoot), path.resolve(leakedDir));
-
-  const inspection = await inspectPlugin(config.fixtures[0], { config });
-  assert.ok(!inspection.sourceFiles.some((file) => file.includes("jail-escape-marker")));
-  assert.ok(!inspection.registrations.includes("registerHttpRoute"));
+  assert.throws(
+    () => fixtureSourceRoot(config, config.fixtures[0]),
+    /sourceRoot .* is outside the plugin root/,
+  );
+  await assert.rejects(
+    () => inspectPlugin(config.fixtures[0], { config }),
+    /sourceRoot .* is outside the plugin root/,
+  );
 
   const absolutePlugin = await writePlugin(workspace, {
     dirName: "abs-source-plugin",
@@ -169,9 +177,10 @@ test("config sourceRoot cannot escape the plugin root via ../ or a Windows absol
     },
   });
   const absoluteConfig = await loadPluginRootConfig(null, { cwd: absolutePlugin });
-  const absoluteSourceRoot = fixtureSourceRoot(absoluteConfig, absoluteConfig.fixtures[0]);
-  assertInside(absolutePlugin, absoluteSourceRoot);
-  assert.notEqual(path.resolve(absoluteSourceRoot), path.resolve(leakedDir));
+  assert.throws(
+    () => fixtureSourceRoot(absoluteConfig, absoluteConfig.fixtures[0]),
+    /sourceRoot .* is outside the plugin root/,
+  );
 });
 
 test("defaultCheckoutPath cannot escape the plugin root via ../ or a Windows absolute path", async (t) => {
@@ -190,8 +199,16 @@ test("defaultCheckoutPath cannot escape the plugin root via ../ or a Windows abs
     rootDir: relativePlugin,
     manifest: { openclaw: { defaultCheckoutPath: "../fake-openclaw" } },
   });
-  assert.equal(relativeTarget.status, "missing");
-  assert.ok(!(relativeTarget.searchedPaths ?? []).includes("../fake-openclaw"));
+  assert.equal(relativeTarget.status, "rejected");
+  assert.deepEqual(relativeTarget.searchedPaths, ["../fake-openclaw"]);
+  assert.equal(relativeTarget.configuredPath, "../fake-openclaw");
+
+  const operatorTarget = await readOpenClawTargetSurface({
+    rootDir: relativePlugin,
+    configuredPath: "../fake-openclaw",
+  });
+  assert.equal(operatorTarget.status, "ok");
+  assert.equal(operatorTarget.configuredPath, "../fake-openclaw");
 
   const absolutePlugin = await writePlugin(workspace, {
     dirName: "absolute-checkout-plugin",
@@ -204,8 +221,12 @@ test("defaultCheckoutPath cannot escape the plugin root via ../ or a Windows abs
     rootDir: absolutePlugin,
     manifest: { openclaw: { defaultCheckoutPath: path.win32.normalize(checkout) } },
   });
-  assert.equal(absoluteTarget.status, "missing");
-  assert.ok(!(absoluteTarget.searchedPaths ?? []).some((candidate) => path.win32.normalize(candidate) === path.win32.normalize(checkout)));
+  assert.equal(absoluteTarget.status, "rejected");
+  assert.ok(
+    (absoluteTarget.searchedPaths ?? []).some(
+      (candidate) => path.win32.normalize(candidate) === path.win32.normalize(checkout),
+    ),
+  );
 });
 
 function pluginFixture() {
@@ -274,10 +295,4 @@ function isUncLike(value) {
   return /^\\\\[^\\]+/u.test(normalized);
 }
 
-function assertInside(rootDir, candidatePath) {
-  const relative = path.relative(path.resolve(rootDir), path.resolve(candidatePath));
-  assert.ok(
-    relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)),
-    `${candidatePath} should stay inside ${rootDir} (relative ${relative})`,
-  );
-}
+
