@@ -147,12 +147,11 @@ Use `plugin-inspector.config.json` for a standalone config file:
   },
   "capture": {
     "mockSdk": true
-  },
-  "openclaw": {
-    "defaultCheckoutPath": "../openclaw"
   }
 }
 ```
+
+Compare against a sibling OpenClaw checkout with `--openclaw ../openclaw` or `openclawPath`. Do not put `../openclaw` in plugin `defaultCheckoutPath`; that setting is jailed to the plugin root.
 
 Inspect the resolved config before wiring CI:
 

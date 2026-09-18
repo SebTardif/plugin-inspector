@@ -202,6 +202,7 @@ test("defaultCheckoutPath cannot escape the plugin root via ../ or a Windows abs
   assert.equal(relativeTarget.status, "rejected");
   assert.deepEqual(relativeTarget.searchedPaths, ["../fake-openclaw"]);
   assert.equal(relativeTarget.configuredPath, "../fake-openclaw");
+  assert.match(relativeTarget.message, /--openclaw \/ openclawPath/);
 
   const operatorTarget = await readOpenClawTargetSurface({
     rootDir: relativePlugin,
@@ -216,6 +217,8 @@ test("defaultCheckoutPath cannot escape the plugin root via ../ or a Windows abs
   });
   assert.equal(pluginRootReport.targetOpenClaw.status, "rejected");
   assert.equal(pluginRootReport.targetOpenClaw.configuredPath, "../fake-openclaw");
+  assert.match(pluginRootReport.targetOpenClaw.message, /--openclaw \/ openclawPath/);
+  assert.ok(pluginRootReport.warnings.some((warning) => warning.code === "target-openclaw-rejected"));
 
   const operatorRootReport = await inspectPluginRoot({
     pluginRoot: relativePlugin,

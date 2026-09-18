@@ -20,6 +20,7 @@ export async function readOpenClawTargetSurface(options = {}) {
       configuredPath: rejectedCheckoutPath,
       searchedPaths: [rejectedCheckoutPath],
       status: "rejected",
+      message: rejectedPluginCheckoutMessage(rejectedCheckoutPath),
     });
   }
   if (requestedPaths.length === 0) {
@@ -514,12 +515,17 @@ function parseStringUnion(source, typeName) {
   return match ? unique([...match[1].matchAll(/["']([^"']+)["']/g)].map((item) => item[1])).sort() : [];
 }
 
-function emptyTargetSurface({ configuredPath, searchedPaths = undefined, status }) {
+export function rejectedPluginCheckoutMessage(configuredPath) {
+  return `plugin defaultCheckoutPath ${JSON.stringify(configuredPath)} is outside the plugin root; pass --openclaw / openclawPath to compare against a sibling checkout`;
+}
+
+function emptyTargetSurface({ configuredPath, searchedPaths = undefined, status, message }) {
   return {
     configuredPath,
     checkoutPath: null,
     searchedPaths,
     status,
+    message,
     compatRecords: [],
     compatRecordStatuses: {},
     hookNames: [],
