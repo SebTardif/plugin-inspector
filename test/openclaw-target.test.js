@@ -72,6 +72,13 @@ export type PluginManifestContracts = {
     "utf8",
   );
   await mkdir(path.join(targetRoot, "src/plugin-sdk"), { recursive: true });
+  await mkdir(path.join(targetRoot, "extensions/browser-security"), { recursive: true });
+  await mkdir(path.join(targetRoot, "scripts/lib"), { recursive: true });
+  await writeFile(
+    path.join(targetRoot, "scripts/lib/plugin-sdk-private-local-only-subpaths.json"),
+    JSON.stringify(["browser-security-internal", "plugin-test-runtime"]),
+    "utf8",
+  );
   await writeFile(
     path.join(targetRoot, "src/plugin-sdk/entrypoints.ts"),
     `export const reservedBundledPluginSdkEntrypoints = ["browser-security-runtime"] as const;
@@ -87,6 +94,7 @@ export const publicPluginOwnedSdkEntrypoints = ["speech-core"] as const;\n`,
 
   assert.equal(target.status, "ok");
   assert.equal(target.configuredPath, "./openclaw");
+  assert.equal(target.checkoutPath, "openclaw");
   assert.deepEqual(target.compatRecords, [
     "hook.before_tool_call.terminal-block-approval",
     "sdk.import.root-barrel-cold-import",
@@ -99,7 +107,14 @@ export const publicPluginOwnedSdkEntrypoints = ["speech-core"] as const;\n`,
   assert.deepEqual(target.apiRegistrars, ["registerService", "registerTool"]);
   assert.deepEqual(target.capturedRegistrars, ["registerService", "registerTool"]);
   assert.deepEqual(target.sdkExports, ["openclaw/plugin-sdk", "openclaw/plugin-sdk/channels"]);
+  assert.deepEqual(target.privateLocalSdkExports, [
+    "openclaw/plugin-sdk/browser-security-internal",
+    "openclaw/plugin-sdk/plugin-test-runtime",
+  ]);
   assert.deepEqual(target.reservedSdkExports, ["openclaw/plugin-sdk/browser-security-runtime"]);
+  assert.deepEqual(target.reservedSdkExportOwners, {
+    "openclaw/plugin-sdk/browser-security-runtime": "browser-security",
+  });
   assert.deepEqual(target.supportedFacadeSdkExports, ["openclaw/plugin-sdk/lmstudio"]);
   assert.deepEqual(target.publicPluginOwnedSdkExports, ["openclaw/plugin-sdk/speech-core"]);
   assert.deepEqual(target.manifestFields, ["contracts", "id"]);

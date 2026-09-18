@@ -1240,6 +1240,127 @@ test("target OpenClaw coverage classifier reports missing public surface", () =>
   assert.ok(result.decisions.some((decision) => decision.seam === "sdk-alias"));
 });
 
+test("target OpenClaw coverage classifier accepts declared private and reserved imports from bundled fixtures", () => {
+  const result = classifyTargetOpenClawCoverage({
+    fixture: { id: "codex", path: "extensions/codex", checkoutPath: "extensions/codex", repo: "local" },
+    inspection: {
+      hooks: [],
+      hookDetails: [],
+      registrationDetails: [],
+    },
+    fixtureReport: {
+      sdkImports: [
+        "openclaw/plugin-sdk/codex-mcp-projection",
+        "openclaw/plugin-sdk/plugin-test-runtime",
+        "openclaw/plugin-sdk/missing",
+      ],
+      sdkImportDetails: [
+        {
+          specifier: "openclaw/plugin-sdk/codex-mcp-projection",
+          ref: "extensions/codex/src/index.ts:1",
+        },
+        {
+          specifier: "openclaw/plugin-sdk/plugin-test-runtime",
+          ref: "extensions/codex/src/index.test.ts:2",
+        },
+        {
+          specifier: "openclaw/plugin-sdk/missing",
+          ref: "extensions/codex/src/index.ts:3",
+        },
+      ],
+      pluginManifests: [],
+    },
+    targetOpenClaw: {
+      status: "ok",
+      checkoutPath: ".",
+      hookNames: [],
+      apiRegistrars: [],
+      sdkExports: [
+        "openclaw/plugin-sdk",
+        "openclaw/plugin-sdk/codex-mcp-projection",
+      ],
+      privateLocalSdkExports: ["openclaw/plugin-sdk/plugin-test-runtime"],
+      reservedSdkExports: ["openclaw/plugin-sdk/codex-mcp-projection"],
+      reservedSdkExportOwners: { "openclaw/plugin-sdk/codex-mcp-projection": "codex" },
+      manifestFields: [],
+      manifestContractFields: [],
+    },
+  });
+
+  const missing = result.warnings.find((finding) => finding.code === "sdk-export-missing");
+  assert.deepEqual(missing?.evidence, [
+    "openclaw/plugin-sdk/missing @ extensions/codex/src/index.ts:3",
+  ]);
+  assert.equal(result.warnings.some((finding) => finding.code === "reserved-sdk-import"), false);
+
+  const externalResult = classifyTargetOpenClawCoverage({
+    fixture: { id: "codex", path: "extensions/codex", checkoutPath: "extensions/codex", repo: "local" },
+    inspection: { hooks: [], hookDetails: [], registrationDetails: [] },
+    fixtureReport: {
+      sdkImports: [
+        "openclaw/plugin-sdk/codex-mcp-projection",
+        "openclaw/plugin-sdk/plugin-test-runtime",
+      ],
+      sdkImportDetails: [
+        {
+          specifier: "openclaw/plugin-sdk/codex-mcp-projection",
+          ref: "extensions/codex/src/index.ts:1",
+        },
+        {
+          specifier: "openclaw/plugin-sdk/plugin-test-runtime",
+          ref: "extensions/codex/src/index.test.ts:2",
+        },
+      ],
+      pluginManifests: [],
+    },
+    targetOpenClaw: {
+      status: "ok",
+      checkoutPath: "../openclaw",
+      hookNames: [],
+      apiRegistrars: [],
+      sdkExports: ["openclaw/plugin-sdk", "openclaw/plugin-sdk/codex-mcp-projection"],
+      privateLocalSdkExports: ["openclaw/plugin-sdk/plugin-test-runtime"],
+      reservedSdkExports: ["openclaw/plugin-sdk/codex-mcp-projection"],
+      reservedSdkExportOwners: { "openclaw/plugin-sdk/codex-mcp-projection": null },
+      manifestFields: [],
+      manifestContractFields: [],
+    },
+  });
+  assert.ok(externalResult.warnings.some((finding) => finding.code === "sdk-export-missing"));
+  assert.ok(externalResult.warnings.some((finding) => finding.code === "reserved-sdk-import"));
+
+  const crossOwnerResult = classifyTargetOpenClawCoverage({
+    fixture: {
+      id: "telegram",
+      path: "extensions/telegram",
+      checkoutPath: "extensions/telegram",
+      repo: "local",
+    },
+    inspection: { hooks: [], hookDetails: [], registrationDetails: [] },
+    fixtureReport: {
+      sdkImports: ["openclaw/plugin-sdk/codex-mcp-projection"],
+      sdkImportDetails: [{
+        specifier: "openclaw/plugin-sdk/codex-mcp-projection",
+        ref: "extensions/telegram/src/index.ts:1",
+      }],
+      pluginManifests: [],
+    },
+    targetOpenClaw: {
+      status: "ok",
+      checkoutPath: ".",
+      hookNames: [],
+      apiRegistrars: [],
+      sdkExports: ["openclaw/plugin-sdk", "openclaw/plugin-sdk/codex-mcp-projection"],
+      privateLocalSdkExports: [],
+      reservedSdkExports: ["openclaw/plugin-sdk/codex-mcp-projection"],
+      reservedSdkExportOwners: { "openclaw/plugin-sdk/codex-mcp-projection": "codex" },
+      manifestFields: [],
+      manifestContractFields: [],
+    },
+  });
+  assert.ok(crossOwnerResult.warnings.some((finding) => finding.code === "reserved-sdk-import"));
+});
+
 test("compatibility fixture classifier reports seam and metadata follow-ups", () => {
   const result = classifyCompatibilityFixture({
     fixture: { id: "fixture", path: "plugins/fixture" },

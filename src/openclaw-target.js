@@ -37,6 +37,10 @@ export async function readOpenClawTargetSurface(options = {}) {
   const currentManifestTypesPath = path.join(resolvedPath, "src/plugins/manifest-types.ts");
   const legacyManifestTypesPath = path.join(resolvedPath, "src/plugins/manifest.ts");
   const pluginSdkEntrypointsPath = path.join(resolvedPath, "src/plugin-sdk/entrypoints.ts");
+  const privateLocalSdkSubpathsPath = path.join(
+    resolvedPath,
+    "scripts/lib/plugin-sdk-private-local-only-subpaths.json",
+  );
   const packagePath = path.join(resolvedPath, "package.json");
 
   const registryEntrySource = await readFile(registryEntryPath, "utf8");
@@ -72,12 +76,21 @@ export async function readOpenClawTargetSurface(options = {}) {
   const sdkExports = existsSync(packagePath)
     ? parsePluginSdkExports(JSON.parse(await readFile(packagePath, "utf8")))
     : [];
+  const privateLocalSdkExports = existsSync(privateLocalSdkSubpathsPath)
+    ? parsePluginSdkSubpathSpecifiers(
+        JSON.parse(await readFile(privateLocalSdkSubpathsPath, "utf8")),
+      )
+    : [];
   const pluginSdkEntrypointsSource = existsSync(pluginSdkEntrypointsPath)
     ? await readFile(pluginSdkEntrypointsPath, "utf8")
     : "";
   const reservedSdkExports = pluginSdkEntrypointsSource
     ? parsePluginSdkEntrypointSpecifiers(pluginSdkEntrypointsSource, "reservedBundledPluginSdkEntrypoints")
     : [];
+  const bundledPluginIds = await readBundledPluginIds(resolvedPath);
+  const reservedSdkExportOwners = Object.fromEntries(
+    reservedSdkExports.map((specifier) => [specifier, resolveBundledSdkOwner(specifier, bundledPluginIds)]),
+  );
   const supportedFacadeSdkExports = pluginSdkEntrypointsSource
     ? parsePluginSdkEntrypointSpecifiers(pluginSdkEntrypointsSource, "supportedBundledFacadeSdkEntrypoints")
     : [];
@@ -87,6 +100,7 @@ export async function readOpenClawTargetSurface(options = {}) {
 
   return {
     configuredPath: requestedPath,
+    checkoutPath: relativePath(rootDir, resolvedPath) || ".",
     searchedPaths: requestedPaths,
     status: "ok",
     compatRegistryPath: relativePath(rootDir, registryPath),
@@ -105,11 +119,14 @@ export async function readOpenClawTargetSurface(options = {}) {
     packagePath: existsSync(packagePath) ? relativePath(rootDir, packagePath) : null,
     sdkExportCount: sdkExports.length,
     sdkExports,
+    privateLocalSdkExportCount: privateLocalSdkExports.length,
+    privateLocalSdkExports,
     pluginSdkEntrypointsPath: existsSync(pluginSdkEntrypointsPath)
       ? relativePath(rootDir, pluginSdkEntrypointsPath)
       : null,
     reservedSdkExportCount: reservedSdkExports.length,
     reservedSdkExports,
+    reservedSdkExportOwners,
     supportedFacadeSdkExports,
     publicPluginOwnedSdkExports,
     manifestTypesPath: existsSync(manifestTypesPath) ? relativePath(rootDir, manifestTypesPath) : null,
@@ -321,6 +338,7 @@ async function readPackedOpenClawTargetSurface({ rootDir, requestedPaths, reques
 
   return {
     configuredPath: requestedPath,
+    checkoutPath: relativePath(rootDir, resolvedPath) || ".",
     searchedPaths: requestedPaths,
     status: "ok",
     version: packageJson.version ?? null,
@@ -340,9 +358,12 @@ async function readPackedOpenClawTargetSurface({ rootDir, requestedPaths, reques
     packagePath: relativePath(rootDir, packagePath),
     sdkExportCount: sdkExports.length,
     sdkExports,
+    privateLocalSdkExportCount: 0,
+    privateLocalSdkExports: [],
     pluginSdkEntrypointsPath: null,
     reservedSdkExportCount: 0,
     reservedSdkExports: [],
+    reservedSdkExportOwners: {},
     supportedFacadeSdkExports: [],
     publicPluginOwnedSdkExports: [],
     manifestTypesPath: manifestDeclaration ? relativePath(rootDir, manifestDeclaration.filePath) : null,
@@ -466,6 +487,7 @@ function parseStringUnion(source, typeName) {
 function emptyTargetSurface({ configuredPath, searchedPaths = undefined, status }) {
   return {
     configuredPath,
+    checkoutPath: null,
     searchedPaths,
     status,
     compatRecords: [],
@@ -474,7 +496,9 @@ function emptyTargetSurface({ configuredPath, searchedPaths = undefined, status 
     apiRegistrars: [],
     capturedRegistrars: [],
     sdkExports: [],
+    privateLocalSdkExports: [],
     reservedSdkExports: [],
+    reservedSdkExportOwners: {},
     supportedFacadeSdkExports: [],
     publicPluginOwnedSdkExports: [],
     manifestFields: [],
@@ -482,8 +506,31 @@ function emptyTargetSurface({ configuredPath, searchedPaths = undefined, status 
   };
 }
 
+async function readBundledPluginIds(openClawRoot) {
+  const extensionsRoot = path.join(openClawRoot, "extensions");
+  if (!existsSync(extensionsRoot)) return [];
+  return (await readdir(extensionsRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((left, right) => right.length - left.length || left.localeCompare(right));
+}
+
+function resolveBundledSdkOwner(specifier, pluginIds) {
+  const entrypoint = specifier.slice("openclaw/plugin-sdk/".length);
+  return pluginIds.find((pluginId) => entrypoint === pluginId || entrypoint.startsWith(`${pluginId}-`)) ?? null;
+}
+
 export function parsePluginSdkEntrypointSpecifiers(source, exportName) {
   return parseExportedStringArray(source, exportName).map((entrypoint) => `openclaw/plugin-sdk/${entrypoint}`).sort();
+}
+
+function parsePluginSdkSubpathSpecifiers(value) {
+  if (!Array.isArray(value)) return [];
+  return unique(
+    value
+      .filter((entrypoint) => typeof entrypoint === "string" && !entrypoint.includes("/"))
+      .map((entrypoint) => `openclaw/plugin-sdk/${entrypoint}`),
+  ).sort();
 }
 
 function parseCapturedRegistrars(source) {
