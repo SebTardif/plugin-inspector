@@ -210,6 +210,21 @@ test("defaultCheckoutPath cannot escape the plugin root via ../ or a Windows abs
   assert.equal(operatorTarget.status, "ok");
   assert.equal(operatorTarget.configuredPath, "../fake-openclaw");
 
+  const pluginRootReport = await inspectPluginRoot({
+    pluginRoot: relativePlugin,
+    generatedAt: "2026-09-18T00:00:00.000Z",
+  });
+  assert.equal(pluginRootReport.targetOpenClaw.status, "rejected");
+  assert.equal(pluginRootReport.targetOpenClaw.configuredPath, "../fake-openclaw");
+
+  const operatorRootReport = await inspectPluginRoot({
+    pluginRoot: relativePlugin,
+    openclawPath: "../fake-openclaw",
+    generatedAt: "2026-09-18T00:00:00.000Z",
+  });
+  assert.equal(operatorRootReport.targetOpenClaw.status, "ok");
+  assert.equal(operatorRootReport.targetOpenClaw.configuredPath, "../fake-openclaw");
+
   const absolutePlugin = await writePlugin(workspace, {
     dirName: "absolute-checkout-plugin",
     config: {

@@ -200,6 +200,13 @@ Common options:
 | `--junit [path]` | Write JUnit XML from `check` or `inspect`; `ci` enables this by default. |
 | `--no-sarif` / `--no-junit` | Disable default `ci` outputs. |
 
+For `batch`, `--concurrency <n>` must be a finite number (default `4`, rounded
+and clamped to `1`–`32` workers). Invalid or missing values fail before inspection
+or report writes. `--keep-plugin-reports` retains individual reports under
+`<out>/plugins/<relative-plugin-path>/`, preserving the corpus directory layout
+and names so plugins such as `a/b`, `a-b`, and `a b` cannot overwrite each other's
+reports. If the corpus root is itself a plugin, its reports go in `<out>/plugins/`.
+
 Run the built-in help for the exact CLI surface:
 
 ```bash
@@ -337,6 +344,15 @@ Gateway method probes invoke each registered handler once, including positional
 aliases do not create extra calls. The handler receives synthetic Gateway
 options and a void `respond(ok, payload, error, meta)` callback. Existing
 `registrationProbeInputs` overrides remain available.
+
+For a method that needs unavailable host state or live credentials, pass
+`gatewayMethodPrerequisites: { "fixture.account": "saved account required" }`
+to `runCapturedSyntheticProbes` or `runEntrypointSyntheticProbes`. The named
+method produces a `blocked` row with its method and reason before its handler
+runs. Other methods retain normal response validation. Once a caller supplies
+the required inputs and runtime, omit that method from the prerequisite map;
+rejected or malformed responses still fail. This option never reports a
+missing prerequisite as a passing runtime check.
 
 The first emitted response is authoritative, even when malformed. Probes check
 its JSON-serialized response/error shape: `ok: true` passes, `ok: false` fails,
@@ -567,6 +583,8 @@ npm run check
 ```
 
 `npm run check` runs the Node test suite and the package-contents guard. The
+test runner limits parallel test files to four so process-supervision tests do
+not contend with a machine-wide burst of child processes for their deadlines. The
 contents guard shells through `npm pack --dry-run --json` and verifies the npm
 tarball includes package entrypoints, examples, README assets, and no private
 `test/`, `scripts/`, or `.github/` paths.

@@ -5,6 +5,16 @@
 ### Fixed
 
 - Jail plugin-owned path strings to the plugin root so inspect and check reject UNC, absolute, and `..` specifiers instead of reading host files or probing a remote SMB share.
+- Recognize OpenClaw's declared private-local Plugin SDK subpaths and reserved bundled-plugin imports when inspecting bundled `extensions/*` fixtures, while continuing to report those imports for external plugins and genuinely missing SDK aliases.
+- Record explicit method-scoped Gateway probe prerequisites before calling handlers that require unavailable host state or live credentials; preserve actual response failures for admitted probes.
+- Preserve absent optional strings in SDK mocks and supply a stable runtime config snapshot to Gateway probes instead of inventing configured values or missing host accessors.
+
+- Generate SDK mocks for literal dynamic imports in retained handlers, including their named exports, while excluding TypeScript import types and keeping source inspection aligned with runtime capture.
+- Honor the OpenClaw lazy-runtime SDK contract in generated mocks, preserving deferred module loading, shared promise caches, explicit cache clearing, and rejected imports instead of returning callable placeholders.
+- Reject invalid batch concurrency instead of reporting success without inspecting any plugins, and preserve relative plugin paths in retained reports so similar directory names cannot overwrite each other's results.
+- Preserve error messages from the OpenClaw `error-runtime` SDK subpath in synthetic probes, including lazy CommonJS imports, so Gateway rejections report their actual cause and remain failures.
+- Keep tool-hook and conversation-privacy contract gaps open when runtime artifacts only capture hook registration. Preserve registration coverage and semantic contract probes.
+- Read OpenClaw compatibility records from the explicitly imported `registry-records.ts` data module, avoiding false missing-record findings after the registry split. Preserve inline registries and report missing delegated data as an error.
 
 ## 0.3.25 - 2026-09-09
 

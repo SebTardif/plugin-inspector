@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { captureEntrypoint, inspectFixtureSet, inspectSourceText, loadInspectorConfig } from "../src/advanced.js";
+import { captureEntrypoint, classifyTargetOpenClawCoverage, inspectCompatibilityFixtureSet, inspectFixtureSet, inspectSourceText, loadInspectorConfig } from "../src/advanced.js";
 
 test("source inspection records hooks and registrars without treating type-only SDK imports as runtime imports", () => {
   const inspection = inspectSourceText(
@@ -144,6 +144,88 @@ test("source inspection separates compact runtime imports from TypeScript import
       "openclaw/plugin-sdk/semicolonless@plugins/example/index.ts:9",
     ],
   );
+});
+
+test("source inspection discovers literal runtime imports without importing promise or quoted expressions", () => {
+  const source = [
+    'type Shape = import("openclaw/plugin-sdk/shared").Shape;',
+    'const { sharedHelper: aliased } = await import("openclaw/plugin-sdk/shared");',
+    'const sdk = await import(`openclaw/plugin-sdk/namespace`); sdk.namespaceHelper;',
+    'const direct = (await import("openclaw/plugin-sdk/direct")).directHelper;',
+    'const load = () => import("openclaw/plugin-sdk/promise").then(() => {});',
+    '// import("openclaw/plugin-sdk/comment");',
+    '/* import("openclaw/plugin-sdk/block-comment"); */',
+    'const text = \'import("openclaw/plugin-sdk/string")\';',
+    'const template = `https://fixture.invalid import("openclaw/plugin-sdk/template-text") ${',
+    '  `nested ${typeof (await import("openclaw/plugin-sdk/template-expression")).templateHelper}`',
+    '}`;',
+    'const computed = (name) => import(`openclaw/plugin-sdk/${name}`);',
+    'const joined = (name) => import("openclaw/plugin-sdk/" + name);',
+    'const property = receiver.import("openclaw/plugin-sdk/property");',
+    'const required = require("openclaw/plugin-sdk/required");',
+  ].join("\n");
+  assert.deepEqual(
+    inspectSourceText(source, "fixture.ts").sdkImports.map(({ specifier, ref }) => [specifier, ref]),
+    [
+      ["openclaw/plugin-sdk/shared", "fixture.ts:2"],
+      ["openclaw/plugin-sdk/namespace", "fixture.ts:3"],
+      ["openclaw/plugin-sdk/direct", "fixture.ts:4"],
+      ["openclaw/plugin-sdk/promise", "fixture.ts:5"],
+      ["openclaw/plugin-sdk/template-expression", "fixture.ts:10"],
+      ["openclaw/plugin-sdk/required", "fixture.ts:15"],
+    ],
+  );
+});
+
+test("source inspection retains dynamic imports conservatively when TypeScript cannot be erased", () => {
+  const source = 'type Shape = import("openclaw/plugin-sdk/uncertain").Shape; const incomplete =';
+  assert.deepEqual(inspectSourceText(source).sdkImports.map(({ specifier }) => specifier),
+    ["openclaw/plugin-sdk/uncertain"]);
+});
+
+test("source compatibility findings retain imports with options, trailing commas, and comments", () => {
+  const source = [
+    'type Only = import("openclaw/plugin-sdk/options").Only;',
+    'const options = import("openclaw/plugin-sdk/options", {});',
+    'const comma = import("openclaw/plugin-sdk/comma",);',
+    'const comment = import("openclaw/plugin-sdk/comment" /* trailing comment */);',
+  ].join("\n");
+  const sdkImportDetails = inspectSourceText(source, "fixture.ts").sdkImports;
+  assert.deepEqual(sdkImportDetails.map(({ specifier, ref }) => [specifier, ref]), [
+    ["openclaw/plugin-sdk/options", "fixture.ts:2"],
+    ["openclaw/plugin-sdk/comma", "fixture.ts:3"],
+    ["openclaw/plugin-sdk/comment", "fixture.ts:4"],
+  ]);
+  const result = classifyTargetOpenClawCoverage({
+    fixture: { id: "fixture" },
+    inspection: { hooks: [], hookDetails: [], registrationDetails: [] },
+    fixtureReport: { sdkImports: sdkImportDetails.map(({ specifier }) => specifier), sdkImportDetails },
+    targetOpenClaw: {
+      status: "ok", hookNames: [], apiRegistrars: [], manifestFields: [], sdkExports: ["openclaw/plugin-sdk"],
+    },
+  });
+  assert.deepEqual(result.warnings.find(({ code }) => code === "sdk-export-missing")?.evidence, [
+    "openclaw/plugin-sdk/options @ fixture.ts:2",
+    "openclaw/plugin-sdk/comma @ fixture.ts:3",
+    "openclaw/plugin-sdk/comment @ fixture.ts:4",
+  ]);
+});
+
+test("source inspection finds imports after quoted regexes at their original location", () => {
+  const source = [
+    `const quote = /["']/;`,
+    'const fake = /require("demo")/;',
+    'const sdk = await import("openclaw/plugin-sdk/after-regex");',
+  ].join("\n");
+  assert.deepEqual(inspectSourceText(source, "fixture.js").sdkImports, [
+    { specifier: "openclaw/plugin-sdk/after-regex", file: "fixture.js", line: 3, ref: "fixture.js:3" },
+  ]);
+});
+
+test("source inspection preserves erased import types when runtime AST analysis fails", () => {
+  const source = 'type Only = import("openclaw/plugin-sdk/type-only").Only; const sdk = await import("openclaw/plugin-sdk/retained"); const sdk = 0;';
+  assert.deepEqual(inspectSourceText(source).sdkImports.map(({ specifier }) => specifier),
+    ["openclaw/plugin-sdk/retained"]);
 });
 
 test("source inspection strips long comments before matching registrations", () => {
@@ -444,6 +526,62 @@ test("fixture set inspection produces a passing report", async () => {
   assert.deepEqual(report.fixtures[0].hooks, ["before_tool_call"]);
   assert.deepEqual(report.fixtures[0].registrations, ["definePluginEntry", "registerTool"]);
   assert.deepEqual(report.fixtures[0].manifestContracts, ["tools"]);
+});
+
+test("compatibility inspection resolves bundled fixture membership before SDK classification", async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-membership-"));
+  const targetDir = path.join(rootDir, "openclaw");
+  const bundledDir = path.join(targetDir, "extensions/bundled");
+  const externalDir = path.join(rootDir, "external");
+  await mkdir(path.join(targetDir, "src/plugins/compat"), { recursive: true });
+  await mkdir(path.join(targetDir, "src/plugin-sdk"), { recursive: true });
+  await mkdir(bundledDir, { recursive: true });
+  await mkdir(externalDir, { recursive: true });
+  await writeFile(path.join(targetDir, "src/plugins/compat/registry.ts"), "export const records = [];\n");
+  await writeFile(
+    path.join(targetDir, "src/plugin-sdk/entrypoints.ts"),
+    'export const reservedBundledPluginSdkEntrypoints = ["bundled-private-runtime"] as const;\n',
+  );
+  await writeFile(
+    path.join(targetDir, "package.json"),
+    JSON.stringify({ exports: { "./plugin-sdk": "./dist/plugin-sdk.js" } }),
+  );
+  for (const fixtureDir of [bundledDir, externalDir]) {
+    await writeFile(
+      path.join(fixtureDir, "index.js"),
+      'import { fixture } from "openclaw/plugin-sdk/bundled-private-runtime";\nvoid fixture;\n',
+    );
+  }
+  const config = {
+    version: 1,
+    submoduleRoot: ".",
+    rootDir,
+    fixtures: [
+      {
+        id: "bundled",
+        path: "openclaw/extensions/bundled",
+        repo: "local",
+        priority: "high",
+        seams: ["plugin-runtime"],
+      },
+      {
+        id: "escaping",
+        path: "openclaw/extensions/../../external",
+        repo: "local",
+        priority: "high",
+        seams: ["plugin-runtime"],
+      },
+    ],
+  };
+
+  const report = await inspectCompatibilityFixtureSet(config, { openclawPath: "openclaw" });
+  assert.equal(
+    report.warnings.some((finding) => finding.fixture === "bundled" && finding.code === "reserved-sdk-import"),
+    false,
+  );
+  assert.ok(
+    report.warnings.some((finding) => finding.fixture === "escaping" && finding.code === "reserved-sdk-import"),
+  );
 });
 
 test("fixture set inspection reports missing expected seams", async () => {

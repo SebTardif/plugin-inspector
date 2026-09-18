@@ -524,7 +524,7 @@ test("compatibility report includes internal findings by default and filters aut
   assert.ok(authorReport.issues.every((issue) => issue.authorRemediation));
 });
 
-test("compatibility report marks inspector gaps covered by runtime execution artifacts", async () => {
+test("compatibility report uses runtime capture for registration gaps, not semantic contracts", async () => {
   const report = await buildCompatibilityReport({
     generatedAt: "test",
     fixtures: [
@@ -546,11 +546,12 @@ test("compatibility report marks inspector gaps covered by runtime execution art
           { name: "llm_input", ref: "plugins/fixture/src/index.ts:1" },
           { name: "before_tool_call", ref: "plugins/fixture/src/index.ts:5" },
         ],
-        registrations: ["registerTool", "registerService", "registerCommand"],
+        registrations: ["registerTool", "registerService", "registerCommand", "registerChannel"],
         registrationDetails: [
           { name: "registerTool", ref: "plugins/fixture/src/index.ts:2" },
           { name: "registerService", ref: "plugins/fixture/src/index.ts:3" },
           { name: "registerCommand", ref: "plugins/fixture/src/index.ts:4" },
+          { name: "registerChannel", ref: "plugins/fixture/src/index.ts:6" },
         ],
         manifestContracts: [],
         manifestFiles: [],
@@ -563,7 +564,7 @@ test("compatibility report marks inspector gaps covered by runtime execution art
       compatRecords: [],
       compatRecordStatuses: {},
       hookNames: ["llm_input", "before_tool_call"],
-      apiRegistrars: ["registerTool", "registerService", "registerCommand"],
+      apiRegistrars: ["registerTool", "registerService", "registerCommand", "registerChannel"],
       capturedRegistrars: [],
       sdkExports: [],
       manifestFields: ["id"],
@@ -581,6 +582,7 @@ test("compatibility report marks inspector gaps covered by runtime execution art
             "registration:registerTool",
             "registration:registerService",
             "registration:registerCommand",
+            "registration:registerChannel",
           ],
         },
         {
@@ -619,19 +621,33 @@ test("compatibility report marks inspector gaps covered by runtime execution art
     .map((issue) => issue.code)
     .sort();
   assert.deepEqual(coveredCodes, [
-    "before-tool-call-probe",
-    "conversation-access-hook",
     "registration-capture-gap",
     "runtime-tool-capture",
   ]);
-  assert.equal(report.summary.runtimeCoveredIssueCount, 4);
-  assert.equal(report.summary.openInspectorGapCount, 0);
+  assert.equal(report.summary.runtimeCoveredIssueCount, 2);
+  assert.equal(report.summary.openInspectorGapCount, 3);
   assert.equal(report.summary.runtimeCoverageArtifactCount, 2);
+
+  for (const code of ["before-tool-call-probe", "conversation-access-hook", "channel-contract-probe"]) {
+    const issue = report.issues.find((item) => item.code === code);
+    assert.ok(issue, code);
+    assert.equal(issue.status, "open");
+    assert.equal(issue.runtimeCoverage, null);
+  }
+  assert.deepEqual(report.contractProbes.map((probe) => probe.id).sort(), [
+    "api.capture.runtime-registrars:fixture",
+    "channel.runtime.envelope-config-metadata:fixture",
+    "hook.before_tool_call.terminal-block-approval:fixture",
+    "hook.llm-observer.privacy-payload:fixture",
+    "tool.registration.schema-capture:fixture",
+  ]);
+  assert.equal(report.summary.contractProbeCount, 5);
 
   const registrationIssue = report.issues.find((issue) => issue.code === "registration-capture-gap");
   assert.deepEqual(registrationIssue.runtimeCoverage.captured, [
     "registration:registerService",
     "registration:registerCommand",
+    "registration:registerChannel",
   ]);
 
   const markdown = renderCompatibilityIssuesReport(report);
@@ -1222,6 +1238,127 @@ test("target OpenClaw coverage classifier reports missing public surface", () =>
   assert.ok(result.warnings.some((finding) => finding.code === "manifest-unknown-contracts"));
   assert.ok(result.logs.some((finding) => finding.code === "manifest-fields-checked"));
   assert.ok(result.decisions.some((decision) => decision.seam === "sdk-alias"));
+});
+
+test("target OpenClaw coverage classifier accepts declared private and reserved imports from bundled fixtures", () => {
+  const result = classifyTargetOpenClawCoverage({
+    fixture: { id: "codex", path: "extensions/codex", checkoutPath: "extensions/codex", repo: "local" },
+    inspection: {
+      hooks: [],
+      hookDetails: [],
+      registrationDetails: [],
+    },
+    fixtureReport: {
+      sdkImports: [
+        "openclaw/plugin-sdk/codex-mcp-projection",
+        "openclaw/plugin-sdk/plugin-test-runtime",
+        "openclaw/plugin-sdk/missing",
+      ],
+      sdkImportDetails: [
+        {
+          specifier: "openclaw/plugin-sdk/codex-mcp-projection",
+          ref: "extensions/codex/src/index.ts:1",
+        },
+        {
+          specifier: "openclaw/plugin-sdk/plugin-test-runtime",
+          ref: "extensions/codex/src/index.test.ts:2",
+        },
+        {
+          specifier: "openclaw/plugin-sdk/missing",
+          ref: "extensions/codex/src/index.ts:3",
+        },
+      ],
+      pluginManifests: [],
+    },
+    targetOpenClaw: {
+      status: "ok",
+      checkoutPath: ".",
+      hookNames: [],
+      apiRegistrars: [],
+      sdkExports: [
+        "openclaw/plugin-sdk",
+        "openclaw/plugin-sdk/codex-mcp-projection",
+      ],
+      privateLocalSdkExports: ["openclaw/plugin-sdk/plugin-test-runtime"],
+      reservedSdkExports: ["openclaw/plugin-sdk/codex-mcp-projection"],
+      reservedSdkExportOwners: { "openclaw/plugin-sdk/codex-mcp-projection": "codex" },
+      manifestFields: [],
+      manifestContractFields: [],
+    },
+  });
+
+  const missing = result.warnings.find((finding) => finding.code === "sdk-export-missing");
+  assert.deepEqual(missing?.evidence, [
+    "openclaw/plugin-sdk/missing @ extensions/codex/src/index.ts:3",
+  ]);
+  assert.equal(result.warnings.some((finding) => finding.code === "reserved-sdk-import"), false);
+
+  const externalResult = classifyTargetOpenClawCoverage({
+    fixture: { id: "codex", path: "extensions/codex", checkoutPath: "extensions/codex", repo: "local" },
+    inspection: { hooks: [], hookDetails: [], registrationDetails: [] },
+    fixtureReport: {
+      sdkImports: [
+        "openclaw/plugin-sdk/codex-mcp-projection",
+        "openclaw/plugin-sdk/plugin-test-runtime",
+      ],
+      sdkImportDetails: [
+        {
+          specifier: "openclaw/plugin-sdk/codex-mcp-projection",
+          ref: "extensions/codex/src/index.ts:1",
+        },
+        {
+          specifier: "openclaw/plugin-sdk/plugin-test-runtime",
+          ref: "extensions/codex/src/index.test.ts:2",
+        },
+      ],
+      pluginManifests: [],
+    },
+    targetOpenClaw: {
+      status: "ok",
+      checkoutPath: "../openclaw",
+      hookNames: [],
+      apiRegistrars: [],
+      sdkExports: ["openclaw/plugin-sdk", "openclaw/plugin-sdk/codex-mcp-projection"],
+      privateLocalSdkExports: ["openclaw/plugin-sdk/plugin-test-runtime"],
+      reservedSdkExports: ["openclaw/plugin-sdk/codex-mcp-projection"],
+      reservedSdkExportOwners: { "openclaw/plugin-sdk/codex-mcp-projection": null },
+      manifestFields: [],
+      manifestContractFields: [],
+    },
+  });
+  assert.ok(externalResult.warnings.some((finding) => finding.code === "sdk-export-missing"));
+  assert.ok(externalResult.warnings.some((finding) => finding.code === "reserved-sdk-import"));
+
+  const crossOwnerResult = classifyTargetOpenClawCoverage({
+    fixture: {
+      id: "telegram",
+      path: "extensions/telegram",
+      checkoutPath: "extensions/telegram",
+      repo: "local",
+    },
+    inspection: { hooks: [], hookDetails: [], registrationDetails: [] },
+    fixtureReport: {
+      sdkImports: ["openclaw/plugin-sdk/codex-mcp-projection"],
+      sdkImportDetails: [{
+        specifier: "openclaw/plugin-sdk/codex-mcp-projection",
+        ref: "extensions/telegram/src/index.ts:1",
+      }],
+      pluginManifests: [],
+    },
+    targetOpenClaw: {
+      status: "ok",
+      checkoutPath: ".",
+      hookNames: [],
+      apiRegistrars: [],
+      sdkExports: ["openclaw/plugin-sdk", "openclaw/plugin-sdk/codex-mcp-projection"],
+      privateLocalSdkExports: [],
+      reservedSdkExports: ["openclaw/plugin-sdk/codex-mcp-projection"],
+      reservedSdkExportOwners: { "openclaw/plugin-sdk/codex-mcp-projection": "codex" },
+      manifestFields: [],
+      manifestContractFields: [],
+    },
+  });
+  assert.ok(crossOwnerResult.warnings.some((finding) => finding.code === "reserved-sdk-import"));
 });
 
 test("compatibility fixture classifier reports seam and metadata follow-ups", () => {

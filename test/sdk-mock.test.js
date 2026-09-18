@@ -234,6 +234,106 @@ for (const extension of ["mjs", "ts"]) {
   });
 }
 
+test("dynamic mock generation agrees with runtime source imports and excludes promise methods", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-dynamic-imports-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = [
+    'type Shape = import("openclaw/plugin-sdk/dynamic-shared").Shape;',
+    'type Only = import("openclaw/plugin-sdk/type-only").Only;',
+    'const { sharedHelper: aliased } = await import("openclaw/plugin-sdk/dynamic-shared");',
+    'const sdk = await import(`openclaw/plugin-sdk/dynamic-namespace`); sdk.namespaceHelper;',
+    'type NamespaceType = typeof sdk.then;',
+    'function shadowed(sdk) { sdk.then(); }',
+    'const quoted = "sdk.then";',
+    '// sdk.then();',
+    '/* sdk.commentOnly(); */',
+    'const unrelated = { sdk: { then() {} } }; unrelated.sdk.then();',
+    'const spaced = unrelated . sdk . then;',
+    'const templateText = `sdk.templateOnly`;',
+    'const direct = (await import("openclaw/plugin-sdk/dynamic-direct")).directHelper;',
+    'const promise = import("openclaw/plugin-sdk/dynamic-promise").then(() => {});',
+    '// import("openclaw/plugin-sdk/comment-only");',
+    'const text = \'import("openclaw/plugin-sdk/string-only")\';',
+    'const template = `https://fixture.invalid import("openclaw/plugin-sdk/template-only") ${',
+    '  `nested ${typeof (await import("openclaw/plugin-sdk/dynamic-template")).templateHelper}`',
+    '}`;',
+    'const computed = (name) => import(`openclaw/plugin-sdk/${name}`);',
+    'const joined = (name) => import("openclaw/plugin-sdk/" + name);',
+    'const property = receiver.import("openclaw/plugin-sdk/property-only");',
+  ].join("\n");
+  await writeFile(path.join(root, "index.ts"), source);
+  const { pluginSdkDir } = await createMockSdkPackage(root, { pluginRoot: root });
+  const expected = new Map([
+    ["dynamic-shared", ["sharedHelper"]],
+    ["dynamic-namespace", ["namespaceHelper"]],
+    ["dynamic-direct", ["directHelper"]],
+    ["dynamic-promise", []],
+    ["dynamic-template", ["templateHelper"]],
+  ]);
+  assert.deepEqual(inspectSourceText(source).sdkImports.map(({ specifier }) => specifier),
+    [...expected.keys()].map((subpath) => `openclaw/plugin-sdk/${subpath}`));
+  for (const [subpath, names] of expected) {
+    const module = await import(pathToFileURL(path.join(pluginSdkDir, `${subpath}.js`)).href);
+    assert.deepEqual(Object.keys(module).sort(), ["default", ...names].sort(), subpath);
+    for (const name of names) assert.equal(typeof module[name], "function");
+  }
+  for (const subpath of ["type-only", "comment-only", "string-only", "template-only", "property-only"]) {
+    await assert.rejects(stat(path.join(pluginSdkDir, `${subpath}.js`)), { code: "ENOENT" });
+  }
+});
+
+for (const extension of ["mjs", "ts", "cjs"]) {
+  for (const rejected of [false, true]) {
+    test(`mock ${extension} dynamic imports load in retained handlers and ${rejected ? "preserve rejection" : "respond successfully"}`, {
+      skip: extension === "cjs" && !supportsCommonJsMocks,
+    }, async (t) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-dynamic-handler-"));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      await writeFile(path.join(root, `index.${extension}`), [
+        extension === "cjs"
+          ? 'const { formatErrorMessage } = require("openclaw/plugin-sdk/error-runtime");'
+          : 'import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";',
+        "let registered = false;",
+        `${extension === "cjs" ? "module.exports =" : "export default"} { register(api) {`,
+        "  api.registerGatewayMethod('fixture.dynamic', async ({ respond }) => {",
+        "    if (!registered) throw new Error('handler ran during registration');",
+        '    const { readStringField: readField } = await import("openclaw/plugin-sdk/dynamic-destructure", {});',
+        '    const sdk = await import(`openclaw/plugin-sdk/dynamic-namespace`,);',
+        extension === "ts" ? '    type NamespaceType = typeof sdk.then;' : '',
+        '    const quoted = "sdk.then";',
+        '    // sdk.then();',
+        '    const unrelated = { sdk: { then() {} } }; unrelated.sdk.then();',
+        '    const direct = (await import("openclaw/plugin-sdk/dynamic-direct" /* trailing comment */))?.asOptionalRecord;',
+        '    const callbackValue = await import("openclaw/plugin-sdk/dynamic-then").then(({ readStringField }) => readStringField({ value: "callback loaded" }, "value"));',
+        '    const callbackRecord = await import("openclaw/plugin-sdk/dynamic-then-namespace")?.then(sdk => sdk.isRecord({}));',
+        '    const template = `https://fixture.invalid ${`nested ${(await import("openclaw/plugin-sdk/dynamic-template")).readStringField({ value: "loaded" }, "value")}`}`;',
+        "    const value = readField({ message: 'dynamic exports loaded' }, 'message');",
+        "    if (value !== 'dynamic exports loaded' || !sdk.isRecord({}) || sdk.isRecord([]) || direct([]) !== undefined || !template.endsWith('nested loaded') || callbackValue !== 'callback loaded' || !callbackRecord) {",
+        "      throw new Error('dynamic SDK exports missing');",
+        "    }",
+        rejected
+          ? "    respond(false, undefined, { code: 'UNAVAILABLE', message: formatErrorMessage(new Error('fixture prerequisite missing')) });"
+          : "    respond(true, { value });",
+        "  });",
+        "  registered = true;",
+        "} };",
+        'function shadowed(sdk) { sdk.then(); }',
+      ].join("\n"));
+      const result = await runEntrypointSyntheticProbes(`index.${extension}`, {
+        cwd: root, pluginRoot: root, mockSdk: true,
+      });
+      assert.deepEqual(result.summary, {
+        probeCount: 1, passCount: rejected ? 0 : 1, failCount: rejected ? 1 : 0, blockedCount: 0,
+      });
+      if (rejected) {
+        assert.equal(result.results[0].error, "Gateway response error: fixture prerequisite missing");
+      } else {
+        assert.deepEqual(result.results[0].output, { type: "object", keys: ["id", "ok", "payload", "type"] });
+      }
+    });
+  }
+}
+
 for (const extension of ["mjs", "cjs"]) {
   test(`mock ${extension} capture follows a symlinked plugin root`, async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-sdk-symlink-"));
@@ -294,6 +394,191 @@ test("CommonJS template expressions discover and load SDK requirements without t
     { type: "boolean", value: true });
 });
 
+for (const extension of ["mjs", "cjs"]) {
+  test(`mock ${extension} Gateway rejections preserve error-runtime messages`, {
+    skip: extension === "cjs" && !supportsCommonJsMocks,
+  }, async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-sdk-error-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    await writeFile(path.join(root, `index.${extension}`), [
+      extension === "mjs"
+        ? 'import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";'
+        : "",
+      `${extension === "cjs" ? "module.exports =" : "export default"} { register(api) {`,
+      "  api.registerGatewayMethod('fixture.rejection', ({ respond }) => {",
+      extension === "cjs"
+        ? '    const { formatErrorMessage } = require("openclaw/plugin-sdk/error-runtime");'
+        : "",
+      "    const message = formatErrorMessage(new Error('fixture prerequisite missing'));",
+      "    if (typeof message !== 'string') throw new Error('error formatter returned a non-string');",
+      "    respond(false, undefined, { code: 'UNAVAILABLE', message });",
+      "  });",
+      "} };",
+    ].join("\n"));
+
+    const result = await runEntrypointSyntheticProbes(`index.${extension}`, {
+      cwd: root, pluginRoot: root, mockSdk: true,
+    });
+    assert.deepEqual(result.summary, { probeCount: 1, passCount: 0, failCount: 1, blockedCount: 0 });
+    assert.equal(result.results[0].error, "Gateway response error: fixture prerequisite missing");
+  });
+}
+
+async function loadLazyRuntimeMock(t) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-sdk-lazy-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { pluginSdkDir } = await createMockSdkPackage(root);
+  return import(pathToFileURL(path.join(pluginSdkDir, "lazy-runtime.js")).href);
+}
+
+test("mock lazy runtime modules defer imports and reuse their promise until cleared", async (t) => {
+  const { createLazyRuntimeModule } = await loadLazyRuntimeMock(t);
+  const module = { value: "loaded" };
+  let calls = 0;
+  const load = createLazyRuntimeModule(async () => { calls += 1; return module; });
+  assert.equal(calls, 0);
+  assert.equal(load.peek(), undefined);
+  const first = load();
+  assert.equal(calls, 0);
+  assert.equal(load(), first);
+  assert.equal(load.peek(), first);
+  assert.equal(await first, module);
+  assert.equal(load(), first);
+  assert.equal(calls, 1);
+  load.clear();
+  assert.equal(load.peek(), undefined);
+  const next = load();
+  assert.notEqual(next, first);
+  assert.equal(await next, module);
+  assert.equal(calls, 2);
+});
+
+for (const phase of ["import", "selection"]) {
+  test(`mock lazy runtime caches ${phase} failures until cleared`, async (t) => {
+    const { createLazyRuntimeSurface } = await loadLazyRuntimeMock(t);
+    const failure = new Error("fixture runtime unavailable");
+    let calls = 0;
+    const load = createLazyRuntimeSurface(() => {
+      calls += 1;
+      if (phase === "import") throw failure;
+      return Promise.resolve({});
+    }, () => { throw failure; });
+    const first = load();
+    assert.equal(calls, 0);
+    await assert.rejects(first, (error) => error === failure);
+    assert.equal(load(), first);
+    assert.equal(load.peek(), first);
+    assert.equal(calls, 1);
+    load.clear();
+    const next = load();
+    assert.notEqual(next, first);
+    await assert.rejects(next, (error) => error === failure);
+    assert.equal(calls, 2);
+  });
+}
+
+for (const rejected of [false, true]) {
+  test(`mock lazy runtime clear protects replacement from stale ${rejected ? "rejection" : "fulfillment"}`, async (t) => {
+    const { createLazyRuntimeModule } = await loadLazyRuntimeMock(t);
+    let settleOld;
+    let resolveNew;
+    const pending = [
+      new Promise((resolve, reject) => { settleOld = rejected ? reject : resolve; }),
+      new Promise((resolve) => { resolveNew = resolve; }),
+    ];
+    const load = createLazyRuntimeModule(() => pending.shift());
+    const first = load();
+    await Promise.resolve();
+    const oldOutcome = rejected
+      ? assert.rejects(first, /stale runtime/)
+      : first.then((value) => assert.equal(value, "stale runtime"));
+    load.clear();
+    const next = load();
+    assert.notEqual(next, first);
+    settleOld(rejected ? new Error("stale runtime") : "stale runtime");
+    await oldOutcome;
+    assert.equal(load.peek(), next);
+    assert.equal(load(), next);
+    resolveNew("current runtime");
+    assert.equal(await next, "current runtime");
+    assert.equal(load(), next);
+  });
+}
+
+test("mock lazy runtime named exports and method binders use the selected surface", async (t) => {
+  const sdk = await loadLazyRuntimeMock(t);
+  const module = { service: { offset: 7, add(a, b) { return this.offset + a + b; } } };
+  let imports = 0;
+  let selections = 0;
+  const load = sdk.createLazyRuntimeSurface(async () => { imports += 1; return module; }, (value) => {
+    selections += 1;
+    return value.service;
+  });
+  const add = sdk.createLazyRuntimeMethod(load, (service) => service.add.bind(service));
+  const bound = sdk.createLazyRuntimeMethodBinder(load)((service) => service.add.bind(service));
+  assert.equal(imports, 0);
+  assert.equal(await add(1, 2), 10);
+  assert.equal(await bound(3, 4), 14);
+  assert.equal(imports, 1);
+  assert.equal(selections, 1);
+  const named = sdk.createLazyRuntimeNamedExport(async () => module, "service");
+  const first = named();
+  assert.equal(named(), first);
+  assert.equal(await first, module.service);
+});
+
+for (const extension of ["mjs", "cjs"]) {
+  for (const rejected of [false, true]) {
+    test(`mock ${extension} Gateway lazy runtime ${rejected ? "rejection remains failed" : "loads after registration"}`, {
+      skip: extension === "cjs" && !supportsCommonJsMocks,
+    }, async (t) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-sdk-lazy-gateway-"));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      await writeFile(path.join(root, "runtime.mjs"), [
+        'import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";',
+        'export const value = formatErrorMessage(new Error("fixture runtime value"));',
+      ].join("\n"));
+      await writeFile(path.join(root, `index.${extension}`), [
+        extension === "mjs" ? 'import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";' : "",
+        extension === "mjs" ? 'import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";' : "",
+        "let registered = false;",
+        "async function importRuntime() {",
+        "  if (!registered) throw new Error('runtime loaded during registration');",
+        rejected ? "  throw new Error('fixture runtime unavailable');" : "  return import('./runtime.mjs');",
+        "}",
+        extension === "mjs" ? "const load = createLazyRuntimeModule(importRuntime);" : "let load;",
+        `${extension === "cjs" ? "module.exports =" : "export default"} { register(api) {`,
+        "  if (load?.peek() !== undefined) throw new Error('runtime load started before handler');",
+        "  api.registerGatewayMethod('fixture.lazy', async ({ respond }) => {",
+        extension === "cjs" ? '    const { createLazyRuntimeModule } = require("openclaw/plugin-sdk/lazy-runtime");' : "",
+        extension === "cjs" ? '    const { formatErrorMessage } = require("openclaw/plugin-sdk/error-runtime");' : "",
+        extension === "cjs" ? "    load ??= createLazyRuntimeModule(importRuntime);" : "",
+        "    try {",
+        "      const first = load();",
+        "      if (load() !== first || load.peek() !== first) throw new Error('runtime promise was not reused');",
+        "      const runtime = await first;",
+        "      if (runtime.value !== 'fixture runtime value') throw new Error('runtime SDK import was not preserved');",
+        "      respond(true, { value: runtime.value });",
+        "    } catch (error) {",
+        "      respond(false, undefined, { code: 'UNAVAILABLE', message: formatErrorMessage(error) });",
+        "    }",
+        "  });",
+        "  registered = true;",
+        "} };",
+      ].join("\n"));
+      const result = await runEntrypointSyntheticProbes(`index.${extension}`, {
+        cwd: root, pluginRoot: root, mockSdk: true,
+      });
+      assert.deepEqual(result.summary, {
+        probeCount: 1, passCount: rejected ? 0 : 1, failCount: rejected ? 1 : 0, blockedCount: 0,
+      });
+      if (rejected) {
+        assert.equal(result.results[0].error, "Gateway response error: fixture runtime unavailable");
+      }
+    });
+  }
+}
+
 test("mock SDK ignores subpaths that would escape the plugin-sdk package", async () => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-sdk-mock-"));
   const pluginRoot = path.join(rootDir, "plugin");
@@ -309,15 +594,15 @@ test("mock SDK ignores subpaths that would escape the plugin-sdk package", async
   await assert.rejects(stat(path.join(rootDir, "node_modules", "openclaw", "escape.js")), { code: "ENOENT" });
 });
 
-test("mock SDK preserves the isRecord predicate contract", async () => {
+test("mock SDK preserves string and record coercion contracts", async () => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "plugin-inspector-sdk-mock-"));
   const pluginRoot = path.join(rootDir, "plugin");
   await mkdir(pluginRoot, { recursive: true });
   await writeFile(
     path.join(pluginRoot, "index.js"),
     [
-      'import { asNullableRecord, asOptionalRecord, asRecord, isRecord, readStringField } from "openclaw/plugin-sdk/string-coerce-runtime";',
-      "export { asNullableRecord, asOptionalRecord, asRecord, isRecord, readStringField };",
+      'import { asNullableRecord, asOptionalRecord, asRecord, isRecord, readStringField, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";',
+      "export { asNullableRecord, asOptionalRecord, asRecord, isRecord, readStringField, normalizeOptionalString };",
       "",
     ].join("\n"),
     "utf8",
@@ -346,4 +631,8 @@ test("mock SDK preserves the isRecord predicate contract", async () => {
   assert.equal(mockModule.readStringField(record, "value"), "ok");
   assert.equal(mockModule.readStringField(record, "count"), undefined);
   assert.equal(mockModule.readStringField(undefined, "value"), undefined);
+  for (const value of [undefined, null, false, 0, {}, [], "", "  \t\n"]) {
+    assert.equal(mockModule.normalizeOptionalString(value), undefined);
+  }
+  assert.equal(mockModule.normalizeOptionalString("  fixture-value  "), "fixture-value");
 });

@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, realpath, writeFile } from "node:fs/promises"
 import * as nodeModule from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { collectRuntimeModuleImports } from "./runtime-imports.js";
 
 const SOURCE_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"]);
 const SKIP_DIRS = new Set([".git", "coverage", "node_modules", "reports"]);
@@ -164,6 +165,14 @@ export const mockSdkSubpathExports = {
     "normalizeSecretInputString",
   ],
   "plugin-runtime": ["createLoggerBackedRuntime", "createSubsystemLogger"],
+  "lazy-runtime": [
+    "createLazyRuntimeModule",
+    "createLazyRuntimeMethod",
+    "createLazyRuntimeMethodBinder",
+    "createLazyRuntimeNamedExport",
+    "createLazyRuntimeSurface",
+  ],
+  "error-runtime": ["formatErrorMessage"],
   "secret-input": [
     "buildOptionalSecretInputSchema",
     "buildSecretInputArraySchema",
@@ -430,60 +439,10 @@ function parseModuleImports(text) {
   for (const match of text.matchAll(/\bimport\s+["']([^"']+)["']/g)) {
     entries.push({ specifier: match[1], names: new Set() });
   }
-  for (const { specifier, binding, member } of collectCommonJsRequires(text)) {
-    const names = new Set();
-    if (binding?.startsWith("{")) {
-      for (const part of binding.slice(1, -1).split(",")) {
-        const name = part.split(/[:=]/)[0].trim();
-        if (isValidExportName(name)) names.add(name);
-      }
-    } else if (binding) {
-      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      for (const access of text.matchAll(new RegExp(`(?<![$\\w])${escaped}\\s*\\.\\s*([$\\w]+)`, "g"))) {
-        names.add(access[1]);
-      }
-    }
-    if (member) names.add(member);
-    entries.push({ specifier, names, require: true });
+  for (const { specifier, names, kind } of collectRuntimeModuleImports(text)) {
+    entries.push({ specifier, names, require: kind === "require" });
   }
   return entries;
-}
-
-export function* collectCommonJsRequires(text) {
-  const code = /\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|(?<![$\w.])(?:(?:const|let|var)\s+(\{[^{}]*\}|[$A-Z_a-z][$\w]*)\s*=\s*)?require\s*\(\s*["']([^"']+)["']\s*\)(?:\s*\.\s*([$A-Z_a-z][$\w]*))?|[`{}]/g;
-  const template = /\\[\s\S]|`|\$\{/g;
-  const templateDepths = [];
-  let inTemplateText = false;
-  let cursor = 0;
-  // Skip quoted/comment text, but scan executable template interpolations.
-  while (cursor < text.length) {
-    const pattern = inTemplateText ? template : code;
-    pattern.lastIndex = cursor;
-    const match = pattern.exec(text);
-    if (!match) break;
-    cursor = pattern.lastIndex;
-    if (inTemplateText) {
-      if (match[0] === "`") {
-        templateDepths.pop();
-        inTemplateText = false;
-      } else if (match[0] === "${") {
-        templateDepths[templateDepths.length - 1] = 1;
-        inTemplateText = false;
-      }
-      continue;
-    }
-    if (match[0] === "`") {
-      templateDepths.push(0);
-      inTemplateText = true;
-    } else if (templateDepths.length && match[0] === "{") {
-      templateDepths[templateDepths.length - 1] += 1;
-    } else if (templateDepths.length && match[0] === "}") {
-      inTemplateText = --templateDepths[templateDepths.length - 1] === 0;
-    }
-    if (match[2]) {
-      yield { specifier: match[2], binding: match[1], member: match[3], index: match.index };
-    }
-  }
 }
 
 function isTypeOnlyImportOrExport(statement, clause) {
@@ -741,6 +700,11 @@ function isValidExportName(name) {
 }
 
 function genericExportStatement(name) {
+  if (name === "normalizeOptionalString") {
+    // Optional values stay absent; an empty string invents explicit input in
+    // callers that distinguish undefined from a configured policy value.
+    return 'export function normalizeOptionalString(value) { return typeof value === "string" ? value.trim() || undefined : undefined; }';
+  }
   if (name === "isRecord") {
     return "export function isRecord(value) { return isPlainObject(value); }";
   }
@@ -1756,6 +1720,37 @@ export function createRuntimeEnv(env = {}) {
 
 export function resolveRuntimeEnv(env = {}) {
   return createRuntimeEnv(env);
+}
+
+export function createLazyRuntimeSurface(importer, select) {
+  let promise;
+  const load = () => {
+    // SDK runtime imports retain the same promise, including rejection, until clear().
+    promise ??= Promise.resolve().then(() => importer().then(select));
+    return promise;
+  };
+  load.peek = () => promise;
+  load.clear = () => { promise = undefined; };
+  return load;
+}
+
+export function createLazyRuntimeModule(importer) {
+  return createLazyRuntimeSurface(importer, (module) => module);
+}
+
+export function createLazyRuntimeNamedExport(importer, key) {
+  return createLazyRuntimeSurface(importer, (module) => module[key]);
+}
+
+export function createLazyRuntimeMethod(load, select) {
+  return async (...args) => {
+    const method = select(await load());
+    return await method(...args);
+  };
+}
+
+export function createLazyRuntimeMethodBinder(load) {
+  return (select) => createLazyRuntimeMethod(load, select);
 }
 
 export function createLoggerBackedRuntime(logger = console) {

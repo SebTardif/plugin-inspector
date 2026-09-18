@@ -884,10 +884,22 @@ function classifySdkImportCoverage({ fixture, fixtureReport, targetOpenClaw, war
   }
 
   const sdkExports = new Set(targetOpenClaw.sdkExports);
-  const unknownImports = fixtureReport.sdkImportDetails.filter((sdkImport) => !sdkExports.has(sdkImport.specifier));
+  const bundledPluginId = bundledOpenClawPluginId(fixture, targetOpenClaw);
+  const isBundledFixture = bundledPluginId !== null;
+  const privateLocalSdkExports = new Set(targetOpenClaw.privateLocalSdkExports ?? []);
+  const unknownImports = fixtureReport.sdkImportDetails.filter(
+    (sdkImport) =>
+      !sdkExports.has(sdkImport.specifier) &&
+      !(isBundledFixture && privateLocalSdkExports.has(sdkImport.specifier)),
+  );
   const reservedSdkExports = new Set(targetOpenClaw.reservedSdkExports ?? []);
-  const reservedImports = fixtureReport.sdkImportDetails.filter((sdkImport) =>
-    reservedSdkExports.has(sdkImport.specifier),
+  const reservedImports = fixtureReport.sdkImportDetails.filter(
+    (sdkImport) =>
+      reservedSdkExports.has(sdkImport.specifier) &&
+      !(
+        bundledPluginId !== null &&
+        targetOpenClaw.reservedSdkExportOwners?.[sdkImport.specifier] === bundledPluginId
+      ),
   );
 
   if (reservedImports.length === 0 && unknownImports.length === 0) {
@@ -895,7 +907,9 @@ function classifySdkImportCoverage({ fixture, fixtureReport, targetOpenClaw, war
       fixture: fixture.id,
       code: "sdk-exports-present",
       level: "log",
-      message: "all observed plugin SDK imports exist in target OpenClaw package exports",
+      message: isBundledFixture
+        ? "all observed plugin SDK imports are exported or declared private-local for bundled plugins"
+        : "all observed plugin SDK imports exist in target OpenClaw package exports",
       evidence: fixtureReport.sdkImports,
     });
     return;
@@ -937,6 +951,18 @@ function classifySdkImportCoverage({ fixture, fixtureReport, targetOpenClaw, war
       evidence: unique(reservedImports.map((sdkImport) => sdkImport.specifier)).join(", "),
     });
   }
+}
+
+function bundledOpenClawPluginId(fixture, targetOpenClaw) {
+  if (fixture.repo !== "local" || !fixture.checkoutPath || !targetOpenClaw.checkoutPath) return null;
+  const fixturePath = normalizeRepoPath(fixture.checkoutPath);
+  const targetPath = normalizeRepoPath(targetOpenClaw.checkoutPath);
+  const relativePath = targetPath === "."
+    ? fixturePath
+    : fixturePath.startsWith(`${targetPath}/`)
+      ? fixturePath.slice(targetPath.length + 1)
+      : "";
+  return relativePath.match(/^extensions\/([^/]+)(?:\/|$)/)?.[1] ?? null;
 }
 
 function addVersionDerivedFinding({ finding, fixtureReport, targetOpenClaw, breakages, warnings, suggestions }) {
