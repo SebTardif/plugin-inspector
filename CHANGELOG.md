@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Capture plugins that bind asynchronous state stores or inspect optional instance lifecycle capabilities during registration; preserve capture-local singleton factory state and runtime slots across SDK barrels. State operations and singleton lifecycle drains remain explicitly unsupported by capture mocks.
+
 - Capture namespace SDK imports and published doctor-contract bundles without missing exports; mock doctor descriptors remain inspectable while actual migration execution fails explicitly.
 
 - Capture synchronous bundled module namespaces with scoped SDK mocks on Node.js 22.15+; preserve named callable capture on Node.js 22.13 and report unsupported namespace capture before loading any module.
