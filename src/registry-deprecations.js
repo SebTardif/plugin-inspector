@@ -52,8 +52,9 @@ function addReferencedTypeMembers(stem, typeName, byStem, names) {
   const declaration = byStem.get(stem);
   if (!declaration || !typeName) return;
   const source = declaration.source ?? "";
-  for (const member of membersOfNamedType(source, typeName)) names.add(member);
-  const parent = extendedTypeName(source, typeName);
+  const declaredName = declaredNameForExport(source, typeName);
+  for (const member of membersOfNamedType(source, declaredName)) names.add(member);
+  const parent = extendedTypeName(source, declaredName);
   if (!parent) return;
   const parentBinding = importedBindings(source, stem).find((binding) => binding.local === parent);
   if (parentBinding) addReferencedTypeMembers(parentBinding.stem, parentBinding.imported, byStem, names);
@@ -149,6 +150,19 @@ function usesImportedType(source, localName) {
 function extendedTypeName(source, typeName) {
   const match = strippedDeclaration(source).match(new RegExp(`\\b(?:interface|type)\\s+${typeName}\\b[^{]*\\bextends\\s+([A-Za-z_$][\\w$]*)`));
   return match?.[1] ?? null;
+}
+
+function declaredNameForExport(source, exportedName) {
+  for (const match of strippedDeclaration(source).matchAll(/\bexport\s*\{([^}]+)\}/g)) {
+    for (const part of match[1].split(",")) {
+      const parsed = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(part.trim());
+      if (!parsed) continue;
+      const original = parsed[1];
+      const alias = parsed[2] ?? original;
+      if (alias === exportedName) return original;
+    }
+  }
+  return exportedName;
 }
 
 function membersOfNamedType(source, typeName) {

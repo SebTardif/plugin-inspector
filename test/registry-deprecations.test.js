@@ -280,6 +280,36 @@ test("reachable public type members satisfy a runtime replacement", () => {
   assert.deepEqual(kept.map((record) => record.code), ["tts", "state"]);
 });
 
+test("an export alias resolves to the declared runtime type", () => {
+  const kept = retirementRecordsForPackedTarget([
+    { code: "web", status: "deprecated", replacementExports: ["listProvidersAsync"] },
+    { code: "session", status: "deprecated", replacementExports: ["loadTranscriptEvents"] },
+  ], {
+    packageRoot: "/openclaw",
+    packageJson: { exports: { "./plugin-sdk": "./dist/plugin-sdk/index.js" } },
+    declarations: [
+      {
+        filePath: "/openclaw/dist/plugin-sdk/index.d.ts",
+        source: 'import { ma as PluginRuntime } from "./runtime.js";\nexport { type PluginRuntime };\n',
+      },
+      {
+        filePath: "/openclaw/dist/plugin-sdk/runtime.d.ts",
+        source: [
+          "export interface PluginRuntime {",
+          "  webSearch: { listProvidersAsync(): Promise<string>; };",
+          "}",
+          "export { PluginRuntime as ma };",
+          "export declare function loadTranscriptEvents(): unknown;",
+          "",
+        ].join("\n"),
+      },
+    ],
+  });
+  assert.deepEqual(kept.map((record) => record.code), ["web"]);
+  const binding = sdkRetirements.records.find((item) => item.code === "conversation-binding-sync-persistence");
+  assert.equal(binding.replacementExports.includes("createIMessageConversationBindingManagerV2"), false);
+});
+
 test("a local export list publishes the imported type, not its sibling exports", () => {
   const kept = retirementRecordsForPackedTarget([
     { code: "web", status: "deprecated", replacementExports: ["listProvidersAsync"] },

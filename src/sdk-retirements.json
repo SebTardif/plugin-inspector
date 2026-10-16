@@ -306,7 +306,6 @@
       "docsPath": "/plugins/sdk-migration/how-to-migrate#await-plugin-state-and-conversation-bindings",
       "replacementExports": [
         "createAccountScopedConversationBindingManagerV2",
-        "createIMessageConversationBindingManagerV2",
         "registerSessionBindingAdapterV2"
       ]
     },
