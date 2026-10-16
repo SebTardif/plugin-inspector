@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { readOpenClawTargetSurface } from "../src/openclaw-target.js";
+import { replacementExportNames, retirementRecordsForPackedTarget } from "../src/registry-deprecations.js";
 import { inspectCompatibilityFixtureSet, inspectSourceText } from "../src/inspector.js";
 import sdkRetirements from "../src/sdk-retirements.json" with { type: "json" };
 
@@ -141,7 +142,11 @@ test("ClawHub-style packed targets use the pinned retirement inventory without r
   await mkdir(path.join(target, "dist"), { recursive: true });
   await mkdir(plugin);
   await writeFile(path.join(target, "package.json"), JSON.stringify({ name: "openclaw", version: "2026.10.1", exports: { "./plugin-sdk/sqlite-runtime": "./dist/sqlite.js" } }));
-  await writeFile(path.join(target, "dist/index.d.ts"), "export type PluginManifest = { id: string };\n");
+  await writeFile(path.join(target, "dist/index.d.ts"), [
+    "export type PluginManifest = { id: string };",
+    "export declare function openOpenClawAgentSqliteWorkerStoreV2(): void;",
+    "",
+  ].join("\n"));
   await writeFile(path.join(plugin, "index.js"), 'import { executeSqliteQuerySync } from "openclaw/plugin-sdk/sqlite-runtime";');
   const report = await inspectCompatibilityFixtureSet({ rootDir, fixtures: [{ id: "packed", path: "plugin", seams: [], expect: {} }] }, { openclawPath: target, authorFacing: true });
   assert.equal(report.targetOpenClaw.compatRegistryPath, null);
@@ -152,6 +157,79 @@ test("ClawHub-style packed targets use the pinned retirement inventory without r
   assert.equal(issue?.removeAfter, "2026-12-31");
   assert.match(issue?.replacement, /openOpenClawAgentSqliteWorkerStoreV2/);
   assert.equal(report.status, "pass");
+});
+
+test("packed targets omit retirement advice when the replacement export is absent", async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "inspector-packed-missing-replacement-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const target = path.join(rootDir, "openclaw");
+  const plugin = path.join(rootDir, "plugin");
+  await mkdir(path.join(target, "dist/plugin-sdk"), { recursive: true });
+  await mkdir(plugin);
+  await writeFile(path.join(target, "package.json"), JSON.stringify({
+    name: "openclaw",
+    version: "2026.10.3",
+    exports: { "./plugin-sdk/session-store-runtime": "./dist/plugin-sdk/session-store-runtime.js" },
+  }));
+  await writeFile(path.join(target, "dist/plugin-sdk/session-store-runtime.d.ts"), [
+    "export declare function getSessionEntry(sessionKey: string): unknown;",
+    "",
+  ].join("\n"));
+  await writeFile(path.join(plugin, "index.js"), [
+    'import { getSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";',
+    "export function register(api) { api.runtime.agent.session.getSessionEntry(getSessionEntry); }",
+    "",
+  ].join("\n"));
+  const report = await inspectCompatibilityFixtureSet({
+    rootDir,
+    fixtures: [{ id: "packed", path: "plugin", seams: [], expect: {} }],
+  }, { openclawPath: target, authorFacing: true });
+  const sessionRecord = report.targetOpenClaw.compatDeprecations.find((record) => record.code === "session-store-sync-readers");
+  assert.equal(sessionRecord, undefined);
+  assert.equal(report.targetOpenClaw.compatRecords.includes("session-store-sync-readers"), true);
+  const prescribed = JSON.stringify(report.issues.concat(report.warnings, report.fixtures[0].sdkDeprecations));
+  assert.equal(prescribed.includes("getSessionEntryAsync"), false);
+  assert.equal(report.issues.some((item) => item.deprecatedApi === "openclaw/plugin-sdk/session-store-runtime.getSessionEntry"), false);
+});
+
+test("packed targets keep retirement advice when the replacement export exists", async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "inspector-packed-present-replacement-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const target = path.join(rootDir, "openclaw");
+  const plugin = path.join(rootDir, "plugin");
+  await mkdir(path.join(target, "dist/plugin-sdk"), { recursive: true });
+  await mkdir(plugin);
+  await writeFile(path.join(target, "package.json"), JSON.stringify({
+    name: "openclaw",
+    version: "2026.10.16",
+    exports: { "./plugin-sdk/session-store-runtime": "./dist/plugin-sdk/session-store-runtime.js" },
+  }));
+  await writeFile(path.join(target, "dist/plugin-sdk/session-store-runtime.d.ts"), [
+    "export declare function getSessionEntry(sessionKey: string): unknown;",
+    "export declare function getSessionEntryAsync(sessionKey: string): Promise<unknown>;",
+    "export declare function getConversationSessionAsync(sessionKey: string): Promise<unknown>;",
+    "export declare function readAmbientTranscriptWatermarkAsync(sessionKey: string): Promise<unknown>;",
+    "",
+  ].join("\n"));
+  await writeFile(path.join(plugin, "index.js"), 'import { getSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";\n');
+  const report = await inspectCompatibilityFixtureSet({
+    rootDir,
+    fixtures: [{ id: "packed", path: "plugin", seams: [], expect: {} }],
+  }, { openclawPath: target, authorFacing: true });
+  const issue = report.issues.find((item) => item.deprecatedApi === "openclaw/plugin-sdk/session-store-runtime.getSessionEntry");
+  assert.equal(issue?.code, "sdk-deprecated-api");
+  assert.match(issue?.replacement ?? "", /getSessionEntryAsync/);
+  assert.equal(issue?.removeAfter, "2026-12-31");
+});
+
+test("replacement export names ignore prose and keep callable replacements", () => {
+  assert.deepEqual(replacementExportNames({
+    replacement: "Await getSessionEntryAsync, then keep the synchronous reader through 2026-12-31.",
+  }), ["getSessionEntryAsync"]);
+  assert.deepEqual(retirementRecordsForPackedTarget([
+    { code: "session-store-sync-readers", status: "deprecated", replacement: "Await getSessionEntryAsync." },
+    { code: "undated", status: "deprecated", replacement: "Consult the migration guide." },
+  ], "export declare function getSessionEntry(): unknown;").map((record) => record.code), ["undated"]);
 });
 
 test("packed inventory matches space-separated member names", () => {

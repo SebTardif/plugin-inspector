@@ -1,5 +1,38 @@
 import { collectRuntimeModuleImports } from "./runtime-imports.js";
 
+// Names the retirement text tells an author to call. A packed npm target can
+// be older than this snapshot, so those names have to exist in its
+// declarations before the text is safe to show.
+export function replacementExportNames(record) {
+  const text = typeof record?.replacement === "string" ? record.replacement : "";
+  const names = [];
+  const seen = new Set();
+  const add = (name) => {
+    if (!name || name === "Async" || seen.has(name)) return;
+    seen.add(name);
+    names.push(name);
+  };
+  for (const match of text.matchAll(/\b([A-Za-z_$][\w$]*(?:Async|V\d+))\b/g)) add(match[1]);
+  for (const match of text.matchAll(/\b(?:Await|Use)\s+([A-Za-z_$][\w$]*)/g)) {
+    const name = match[1];
+    if (/[a-z][A-Z]/.test(name) || /(?:Async|V\d+)$/.test(name)) add(name);
+  }
+  return names;
+}
+
+export function retirementRecordsForPackedTarget(records, declarationSource) {
+  const source = declarationSource ?? "";
+  return records.filter((record) => {
+    const names = replacementExportNames(record);
+    if (names.length === 0) return true;
+    return names.every((name) => new RegExp(`\\b${escapeRegExp(name)}\\b`).test(source));
+  });
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
 function parseSurface(api) {
   const sdk = /^(openclaw\/plugin-sdk(?:\/[\w-]+)?)(?:(?:\.|\s+)([\w$]+))?$/.exec(api);
   const symbol = /^[A-Za-z_$][\w$]*$/.test(api) ? api : null;
