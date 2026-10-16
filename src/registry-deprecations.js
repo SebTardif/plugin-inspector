@@ -42,9 +42,10 @@ function collectPublicNames(stem, byStem, names, seenFiles) {
     addReferencedTypeMembers(reexport.stem, reexport.importedName, byStem, names);
   }
   for (const binding of importedBindings(source, stem)) {
-    if (!usesImportedType(source, binding.local)) continue;
+    if (!usesImportedType(source, binding.local) && !localExportNames(source).includes(binding.local)) continue;
     addReferencedTypeMembers(binding.stem, binding.imported, byStem, names);
   }
+  for (const local of localExportNames(source)) names.add(local);
 }
 
 function addReferencedTypeMembers(stem, typeName, byStem, names) {
@@ -121,6 +122,18 @@ function reexportsFrom(source, fromStem) {
   return reexports;
 }
 
+function localExportNames(source) {
+  const names = [];
+  for (const match of strippedDeclaration(source).matchAll(/\bexport\s+(?:type\s+)?\{([^}]+)\}(?!\s+from)/g)) {
+    for (const part of match[1].split(",")) {
+      const cleaned = part.trim().replace(/^type\s+/, "");
+      const parsed = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(cleaned);
+      if (parsed) names.push(parsed[2] ?? parsed[1]);
+    }
+  }
+  return names;
+}
+
 function usesImportedType(source, localName) {
   const text = strippedDeclaration(source).replace(/^import[\s\S]*?from\s+["'][^"']+["'];?$/gm, "");
   const mention = new RegExp(`\\b${localName}\\b`);
@@ -146,7 +159,8 @@ function membersOfNamedType(source, typeName) {
 
 function typeMembers(body) {
   const names = [];
-  for (const member of body.matchAll(/(?:^|\n)\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\s*[?(:]/g)) {
+  for (const member of body.matchAll(/\b([A-Za-z_$][\w$]*)\s*[?(:]/g)) {
+    if (member[1] === "type" || member[1] === "interface" || member[1] === "readonly") continue;
     names.push(member[1]);
   }
   return names;

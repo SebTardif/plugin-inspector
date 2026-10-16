@@ -280,9 +280,47 @@ test("reachable public type members satisfy a runtime replacement", () => {
   assert.deepEqual(kept.map((record) => record.code), ["tts", "state"]);
 });
 
+test("a local export list publishes the imported type, not its sibling exports", () => {
+  const kept = retirementRecordsForPackedTarget([
+    { code: "web", status: "deprecated", replacementExports: ["listProvidersAsync"] },
+    { code: "session", status: "deprecated", replacementExports: ["loadTranscriptEvents"] },
+  ], {
+    packageRoot: "/openclaw",
+    packageJson: { exports: { "./plugin-sdk": "./dist/plugin-sdk/index.js" } },
+    declarations: [
+      {
+        filePath: "/openclaw/dist/plugin-sdk/index.d.ts",
+        source: 'import type { PluginRuntime } from "./runtime.js";\nexport { type PluginRuntime };\n',
+      },
+      {
+        filePath: "/openclaw/dist/plugin-sdk/runtime.d.ts",
+        source: [
+          "export interface PluginRuntime {",
+          "  webSearch: {",
+          "    listProviders(): string;",
+          "    listProvidersAsync(): Promise<string>;",
+          "  };",
+          "}",
+          "export declare function loadTranscriptEvents(): unknown;",
+          "",
+        ].join("\n"),
+      },
+    ],
+  });
+  assert.deepEqual(kept.map((record) => record.code), ["web"]);
+});
+
 test("watched-session advice does not require the caller assertCurrent callback", () => {
   const record = sdkRetirements.records.find((item) => item.code === "watched-sessions-sync-harness-context");
   assert.equal(record.replacementExports.includes("assertCurrent"), false);
+  assert.equal(
+    sdkRetirements.records.find((item) => item.code === "tts-preferences-sync-resolution").replacementExports.includes("prepareTtsPreferences"),
+    false,
+  );
+  assert.equal(
+    sdkRetirements.records.find((item) => item.code === "auth-profile-sync-operations").replacementExports.includes("resolvePathForDisplayAsync"),
+    false,
+  );
   assert.equal(
     sdkRetirements.records.find((item) => item.code === "approval-routing-sync-preparation").replacementExports.includes("createChannelExecApprovalProfileAsync"),
     true,

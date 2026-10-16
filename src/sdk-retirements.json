@@ -166,7 +166,6 @@
       "replacementExports": [
         "loadAuthProfileStoreForRuntimeAsync",
         "updateAuthProfileStoreWithLock",
-        "resolvePathForDisplayAsync",
         "resolveProviderAuthProfileMetadataAsync",
         "isConfiguredAsync",
         "resolveConfigAsync",
@@ -986,8 +985,7 @@
       "docsPath": "/plugins/sdk-migration/async-transcript-and-tts",
       "replacementExports": [
         "resolveTtsPrefsPathAsync",
-        "buildSystemPromptHintAsync",
-        "prepareTtsPreferences"
+        "buildSystemPromptHintAsync"
       ]
     },
     {
