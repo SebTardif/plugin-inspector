@@ -280,6 +280,40 @@ test("reachable public type members satisfy a runtime replacement", () => {
   assert.deepEqual(kept.map((record) => record.code), ["tts", "state"]);
 });
 
+test("an intersection runtime type keeps reachable members and drops sibling exports", () => {
+  const kept = retirementRecordsForPackedTarget([
+    { code: "tts", status: "deprecated", replacementExports: ["buildSystemPromptHintAsync"] },
+    { code: "web", status: "deprecated", replacementExports: ["listProvidersAsync"] },
+    { code: "session", status: "deprecated", replacementExports: ["loadTranscriptEvents"] },
+  ], {
+    packageRoot: "/openclaw",
+    packageJson: { exports: { "./plugin-sdk": "./dist/plugin-sdk/index.js" } },
+    declarations: [
+      {
+        filePath: "/openclaw/dist/plugin-sdk/index.d.ts",
+        source: [
+          'import type { PluginRuntimeCore } from "./core.js";',
+          "export type PluginRuntime = PluginRuntimeCore & {",
+          "  webSearch: { listProvidersAsync(): Promise<string>; };",
+          "};",
+          "",
+        ].join("\n"),
+      },
+      {
+        filePath: "/openclaw/dist/plugin-sdk/core.d.ts",
+        source: [
+          "export interface PluginRuntimeCore {",
+          "  buildSystemPromptHintAsync(): string;",
+          "}",
+          "export declare function loadTranscriptEvents(): unknown;",
+          "",
+        ].join("\n"),
+      },
+    ],
+  });
+  assert.deepEqual(kept.map((record) => record.code), ["tts", "web"]);
+});
+
 test("an export alias resolves to the declared runtime type", () => {
   const kept = retirementRecordsForPackedTarget([
     { code: "web", status: "deprecated", replacementExports: ["listProvidersAsync"] },

@@ -33,6 +33,9 @@ function collectPublicNames(stem, byStem, names, seenFiles) {
   seenFiles.add(stem);
   const source = declaration.source ?? "";
   for (const name of exportedDeclarationNames(source)) names.add(name);
+  for (const alias of exportedTypeAliasNames(source)) {
+    addReferencedTypeMembers(stem, alias, byStem, names);
+  }
   for (const reexport of reexportsFrom(source, stem)) {
     if (reexport.all) {
       collectPublicNames(reexport.stem, byStem, names, seenFiles);
@@ -48,17 +51,26 @@ function collectPublicNames(stem, byStem, names, seenFiles) {
   for (const local of localExportNames(source)) names.add(local);
 }
 
-function addReferencedTypeMembers(stem, typeName, byStem, names) {
+function addReferencedTypeMembers(stem, typeName, byStem, names, seen = new Set()) {
   const declaration = byStem.get(stem);
   if (!declaration || !typeName) return;
   const source = declaration.source ?? "";
   const declaredName = declaredNameForExport(source, typeName);
+  const seenKey = `${stem}:${declaredName}`;
+  if (seen.has(seenKey)) return;
+  seen.add(seenKey);
   for (const member of membersOfNamedType(source, declaredName)) names.add(member);
-  const parent = extendedTypeName(source, declaredName);
-  if (!parent) return;
-  const parentBinding = importedBindings(source, stem).find((binding) => binding.local === parent);
-  if (parentBinding) addReferencedTypeMembers(parentBinding.stem, parentBinding.imported, byStem, names);
-  else for (const member of membersOfNamedType(source, parent)) names.add(member);
+  const rhs = typeAliasRhs(source, declaredName);
+  const parts = intersectionConstituents(rhs);
+  for (const body of parts.objectBodies) {
+    for (const member of typeMembers(body)) names.add(member);
+  }
+  const parents = [extendedTypeName(source, declaredName), ...parts.types].filter(Boolean);
+  for (const parent of parents) {
+    const parentBinding = importedBindings(source, stem).find((binding) => binding.local === parent);
+    if (parentBinding) addReferencedTypeMembers(parentBinding.stem, parentBinding.imported, byStem, names, seen);
+    else addReferencedTypeMembers(stem, parent, byStem, names, seen);
+  }
 }
 
 function declarationStem(filePath, packageRoot) {
@@ -150,6 +162,73 @@ function usesImportedType(source, localName) {
 function extendedTypeName(source, typeName) {
   const match = strippedDeclaration(source).match(new RegExp(`\\b(?:interface|type)\\s+${typeName}\\b[^{]*\\bextends\\s+([A-Za-z_$][\\w$]*)`));
   return match?.[1] ?? null;
+}
+
+function exportedTypeAliasNames(source) {
+  const names = [];
+  for (const match of strippedDeclaration(source).matchAll(/\bexport\s+type\s+([A-Za-z_$][\w$]*)\s*=/g)) {
+    names.push(match[1]);
+  }
+  return names;
+}
+
+function typeAliasRhs(source, typeName) {
+  const text = strippedDeclaration(source);
+  const start = text.search(new RegExp(`\\btype\\s+${typeName}\\s*=`));
+  if (start < 0) return null;
+  const equals = text.indexOf("=", start);
+  let depth = 0;
+  let rhs = "";
+  for (let index = equals + 1; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "{") depth += 1;
+    if (char === "}" && depth > 0) depth -= 1;
+    if (char === ";" && depth === 0) return rhs;
+    rhs += char;
+  }
+  return rhs || null;
+}
+
+function intersectionConstituents(rhs) {
+  const types = [];
+  const objectBodies = [];
+  if (!rhs) return { types, objectBodies };
+  let depth = 0;
+  let current = "";
+  const parts = [];
+  for (const char of rhs) {
+    if (char === "{") {
+      if (depth === 0 && current.trim()) parts.push(current);
+      depth += 1;
+      current = char;
+      continue;
+    }
+    if (char === "}") {
+      current += char;
+      depth -= 1;
+      if (depth === 0) {
+        parts.push(current);
+        current = "";
+      }
+      continue;
+    }
+    if (char === "&" && depth === 0) {
+      if (current.trim()) parts.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) parts.push(current);
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) objectBodies.push(trimmed.slice(1, -1));
+    else {
+      const name = /^([A-Za-z_$][\w$]*)/.exec(trimmed);
+      if (name) types.push(name[1]);
+    }
+  }
+  return { types, objectBodies };
 }
 
 function declaredNameForExport(source, exportedName) {
