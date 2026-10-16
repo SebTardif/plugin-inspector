@@ -75,9 +75,12 @@ function normalizeFixtureCheckoutPath(config, fixture) {
 async function inspectConfiguredFixtures(config, options = {}) {
   const inspections = [];
   const failures = [];
+  // One fixture suite inspects one immutable host. Release its compiler state
+  // with the suite; a later invocation must observe changed target files.
+  const sdkUsageHostCache = options.sdkTargetRoot ? { sources: new Map() } : undefined;
 
   for (const fixture of config.fixtures) {
-    const inspection = await inspectPlugin(fixture, { ...options, config });
+    const inspection = await inspectPlugin(fixture, { ...options, config, sdkUsageHostCache });
     inspections.push(inspection);
 
     for (const [key, observed] of [
@@ -112,10 +115,15 @@ export async function inspectPlugin(fixture, options = {}) {
   const checkoutPath = fixtureCheckoutPath(config, fixture);
   const sourceRoot = fixtureSourceRoot(config, fixture);
 
-  if (!existsSync(checkoutPath)) {
+  if (!existsSync(checkoutPath) || fixture.package && !existsSync(sourceRoot)) {
     return emptyInspection(fixture, "missing");
   }
 
+  // Fixture suites may wrap a standalone nested plugin or an npm payload.
+  // A source-only subdirectory still needs its package-root entrypoint metadata.
+  const sdkUsageRoot = fixture.package || !isPluginRootConfig(config) && fixture.subdir && existsSync(path.join(sourceRoot, "package.json"))
+    ? sourceRoot
+    : checkoutPath;
   const packageInspection = await readPackageMetadata(config, checkoutPath, sourceRoot);
   const includeBuildArtifacts = shouldScanBuildArtifacts(fixture, packageInspection);
   const files = await listSourceFiles(sourceRoot, {
@@ -172,7 +180,7 @@ export async function inspectPlugin(fixture, options = {}) {
     packageEntrypoints: packageInspection.entrypoints,
     sdkImports: uniqueDetails(sdkImportDetails),
     sdkDeprecations: uniqueSdkDeprecations(sdkDeprecationDetails),
-    sdkUsage: await inspectSdkUsage({ root: checkoutPath, inputKind: options.sdkUsageInputKind, targetRoot: options.sdkTargetRoot, compatDeprecations: options.targetOpenClaw?.compatDeprecations }),
+    sdkUsage: await inspectSdkUsage({ root: sdkUsageRoot, inputKind: options.sdkUsageInputKind ?? (fixture.package ? "artifact" : "source"), targetRoot: options.sdkTargetRoot, compatDeprecations: options.targetOpenClaw?.compatDeprecations, hostCache: options.sdkUsageHostCache }),
     sourceFiles: sourceFiles.map((filePath) => path.relative(config.rootDir ?? process.cwd(), filePath)).sort(),
   };
 }

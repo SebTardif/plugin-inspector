@@ -569,8 +569,20 @@ Each entry retains at most 12 evidence sites with source excerpts of at most
 500 UTF-16 code units. Long or minified lines are excerpted around the reference;
 the path and line identify the full source. These bounds never truncate identities.
 
+Complex provenance analysis has a deterministic limit of 2,000,000 steps per
+plugin, including call indexing, alias resolution, member selection, literal
+resolution and caller-context traversal. Exhaustion adds one source-located
+unknown and makes the inventory `partial`. All supplied files remain in scope;
+syntax scanning, literal SDK imports, and direct references to declared entry
+APIs continue. Deep argument-flow references may be missing from a partial
+inventory. The allowance resets for each plugin.
+
 The public `pluginRoot.runCheck` and fixture-suite APIs accept
-`sdkUsageInputKind: "source" | "artifact"` (default `"source"`). Source analysis
+`sdkUsageInputKind: "source" | "artifact"`. The default is `"source"`, except
+npm package fixtures default to `"artifact"`; an explicit option takes precedence.
+Fixture inventories use the npm payload or a configured nested plugin package
+as their root, retaining package-root metadata for source-only subdirectories.
+Source analysis
 includes explicit type syntax; artifact analysis describes the supplied
 published files, including embedded vendor code and dependencies actually
 bundled inside that artifact. Source scans exclude separately installed
@@ -578,7 +590,9 @@ bundled inside that artifact. Source scans exclude separately installed
 types are not inferred back into JavaScript. Inspection does not execute code.
 
 Declared `openclaw.extensions` entrypoints establish the host API parameter for
-plain registration functions and default/CommonJS wrappers. Source mode can
+plain registration functions and default/CommonJS wrappers. Artifact mode uses
+`openclaw.runtimeExtensions` when declared, including packages that omit source
+files. A missing runtime peer does not fall back to source code. Source mode can
 resolve a unique source equivalent of a compiled entrypoint. A missing or
 ambiguous declared entrypoint is an explicit unknown, so the report is partial.
 

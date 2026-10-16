@@ -25,7 +25,7 @@ function publicTypePaths(targetRoot) {
 }
 
 /** Resolve inspected files and the explicit host; never crawl installed dependencies. */
-export function createUsageProgram(files, targetRoot) {
+export function createUsageProgram(files, targetRoot, hostCache) {
   const sources = files.filter((file) => !file.metadata).map((file) => ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true));
   const byPath = new Map(sources.map((source) => [source.fileName, source]));
   function insideTarget(file) {
@@ -40,6 +40,8 @@ export function createUsageProgram(files, targetRoot) {
     ...(targetRoot ? { paths: publicTypePaths(targetRoot) } : {}),
   };
   const host = ts.createCompilerHost(options);
+  const resolutionCache = hostCache?.resolutionCache ?? ts.createModuleResolutionCache(process.cwd(), host.getCanonicalFileName, options);
+  if (hostCache) hostCache.resolutionCache = resolutionCache;
   const realpath = host.realpath?.bind(host);
   host.realpath = (name) => byPath.has(name) ? name : realpath?.(name) ?? name;
   const readSource = host.getSourceFile.bind(host);
@@ -49,7 +51,35 @@ export function createUsageProgram(files, targetRoot) {
     if (byPath.has(name)) return byPath.get(name);
     const library = path.dirname(name) === libraryDirectory && /^lib(?:\..+)?\.d\.ts$/.test(path.basename(name));
     if (!library && !hostFiles.has(name)) return undefined;
-    const source = readSource(name, languageVersion);
+    const cached = hostCache?.sources.get(name);
+    const cachedSource = cached?.source?.deref();
+    let source = cachedSource;
+    if (!source && cached) {
+      source = ts.createSourceFile(name, cached.text, languageVersion, true);
+      source.isDeclarationFile = cached.isDeclarationFile;
+    }
+    if (!source && hostFiles.has(name) && /\.[cm]?tsx?$/.test(name) && !/\.d\.[cm]?ts$/.test(name)) {
+      const text = host.readFile(name);
+      // Declaration emit may drop reference directives without diagnostics.
+      // Retain those sources so referenced host types keep their authorization.
+      if (text !== undefined && !/\/\/\/\s*<reference\b/.test(text)) {
+        // Host implementation bodies can pull the entire core into the type
+        // graph. Keep its declaration view only when TypeScript can preserve
+        // exported types without inference; otherwise retain the source intact.
+        const declaration = ts.transpileDeclaration(text, {
+          fileName: name, reportDiagnostics: true,
+          compilerOptions: { target: options.target, module: options.module, isolatedDeclarations: true },
+        });
+        if (!declaration.diagnostics?.some((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)) {
+          source = ts.createSourceFile(name, declaration.outputText, languageVersion, true);
+          source.isDeclarationFile = true;
+        }
+      }
+    }
+    source ??= readSource(name, languageVersion);
+    // Reuse host syntax while it remains live, but let memory pressure collect
+    // unused trees. The current program keeps its own input trees alive.
+    if (source && hostCache && !cachedSource) hostCache.sources.set(name, { text: source.text, isDeclarationFile: source.isDeclarationFile, source: new WeakRef(source) });
     // Public host declarations may reference their own declaration files.
     // Plugin reference directives never authorize files outside the input set.
     if (source && hostFiles.has(name)) for (const reference of source.referencedFiles) {
@@ -59,9 +89,11 @@ export function createUsageProgram(files, targetRoot) {
     return source;
   };
   host.resolveModuleNames = (names, containingFile) => names.map((name) => {
-    const resolved = ts.resolveModuleName(name, containingFile, options, host).resolvedModule;
+    const resolved = ts.resolveModuleName(name, containingFile, options, host, resolutionCache).resolvedModule;
     if (!resolved) return undefined;
-    if (byPath.has(resolved.resolvedFileName)) return resolved;
+    // TypeScript redirects equal package IDs to one copy, leaving other input
+    // ASTs unbound. Inventory every physical bundled file with its own evidence.
+    if (byPath.has(resolved.resolvedFileName)) return { ...resolved, packageId: undefined };
     // Only the explicit public host target may add files outside the inspected
     // set. A plugin-relative import must not crawl neighboring source trees.
     if (!insideTarget(resolved.resolvedFileName)) return undefined;
@@ -72,6 +104,8 @@ export function createUsageProgram(files, targetRoot) {
     return undefined;
   });
   host.writeFile = () => {};
+  // Share immutable host inputs, not the previous plugin's program/checker.
+  // Retaining that graph overlaps two large published artifacts in memory.
   const program = ts.createProgram(sources.map((source) => source.fileName), options, host);
   const checker = program.getTypeChecker();
   function localSource(specifier, from) {

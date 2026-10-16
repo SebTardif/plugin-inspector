@@ -2,11 +2,24 @@ import ts from "typescript";
 import { isSdkSpecifier, nameText, stringExpressionPrefix, walk } from "./syntax.js";
 import { createTypeProvenance } from "./types.js";
 import { capabilityContextMember } from "./host-context.js";
+import { createCallTargetResolver } from "./call-targets.js";
 
 const sdkExport = (module, name) => ({ kind: "export", module, name });
 
 /** Follow unchanged values; wrappers and arbitrary SDK return values do not inherit identity. */
-export function createProvenance({ checker, program, localSource, sources, targetRoot, entrypoints = [] }) {
+export function createProvenance({ checker, program, localSource, sources, targetRoot, entrypoints = [], onWorkLimit }) {
+  const maxWork = 2_000_000;
+  let remainingWork = maxWork;
+  let workLimitReached = false;
+  let lastWorkNode;
+  function consumeWork(node) {
+    if (node) lastWorkNode = node;
+    if (workLimitReached) return false;
+    if (remainingWork-- > 0) return true;
+    workLimitReached = true;
+    onWorkLimit(lastWorkNode.getFirstToken() ?? lastWorkNode, `SDK provenance analysis exceeded its per-plugin limit of ${maxWork.toLocaleString("en-US")} steps; usage inventory may be incomplete`);
+    return false;
+  }
   const resolving = new Set();
   const resolvingSymbols = new Set();
   let scope = { bindings: new Map(), literalBindings: new Map(), functions: new Set(), cache: new WeakMap() };
@@ -17,6 +30,7 @@ export function createProvenance({ checker, program, localSource, sources, targe
   const restArgumentsByParameter = new Map();
   const callsByFunction = new Map();
   const assignments = new Map();
+  const overwrittenNativeMembers = new Set();
   const entryParameters = new Set();
   function inScope(next, operation) {
     const previous = scope;
@@ -24,18 +38,11 @@ export function createProvenance({ checker, program, localSource, sources, targe
     try { return operation(); } finally { scope = previous; }
   }
   for (const source of sources) walk(source, (node) => {
-    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
-      const declaration = checker.getResolvedSignature(node)?.declaration;
-      if (declaration && sourceNames.has(declaration.getSourceFile().fileName)) {
-        callsByFunction.set(declaration, [...(callsByFunction.get(declaration) ?? []), node]);
-        for (const [index, parameter] of declaration.parameters.entries()) {
-          if (parameter.dotDotDotToken) {
-            restArgumentsByParameter.set(parameter, [...(restArgumentsByParameter.get(parameter) ?? []), [...(node.arguments ?? [])].slice(index)]);
-            continue;
-          }
-          const argument = node.arguments?.[index];
-          if (argument) argumentsByParameter.set(parameter, [...(argumentsByParameter.get(parameter) ?? []), argument]);
-        }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))) {
+      const name = ts.isPropertyAccessExpression(node.left) ? node.left.name.text : nameText(node.left.argumentExpression);
+      if (["all", "resolve", "bind"].includes(name)) {
+        const symbol = checker.getSymbolAtLocation(node.left);
+        if (symbol) overwrittenNativeMembers.add(symbol);
       }
     }
     if (ts.isBinaryExpression(node) && [ts.SyntaxKind.EqualsToken, ts.SyntaxKind.QuestionQuestionEqualsToken, ts.SyntaxKind.BarBarEqualsToken].includes(node.operatorToken.kind) && (ts.isIdentifier(node.left) || ts.isPropertyAccessExpression(node.left) && node.left.expression.kind === ts.SyntaxKind.ThisKeyword)) {
@@ -43,6 +50,119 @@ export function createProvenance({ checker, program, localSource, sources, targe
       assignments.set(symbol, [...(assignments.get(symbol) ?? []), node.right]);
     }
   });
+  const unresolvedCallTargets = new WeakSet();
+  const deferredCalls = new Set();
+  const deferredTargets = new WeakMap();
+  const resolverOptions = { checker, program, localSource, sourceNames, consumeWork, assignments, overwrittenNativeMembers, onUnresolvedCall: (node) => unresolvedCallTargets.add(node), onDeferredParameterCall: (node) => deferredCalls.add(node) };
+  const callDeclarations = createCallTargetResolver(resolverOptions);
+  function indexCall(node, resolveTargets) {
+    let changed = false;
+    const targets = resolveTargets(node);
+    for (const previous of deferredTargets.get(node) ?? []) {
+      if (targets.includes(previous)) continue;
+      changed = true;
+      callsByFunction.set(previous, (callsByFunction.get(previous) ?? []).filter((call) => call !== node));
+      for (const [index, parameter] of previous.parameters.entries()) {
+        if (parameter.dotDotDotToken) {
+          const prior = restArgumentsByParameter.get(parameter) ?? [];
+          const args = [...(node.arguments ?? [])].slice(index);
+          const remove = prior.findIndex((items) => items.length === args.length && items.every((item, position) => item === args[position]));
+          restArgumentsByParameter.set(parameter, prior.filter((_, position) => position !== remove));
+        } else argumentsByParameter.set(parameter, (argumentsByParameter.get(parameter) ?? []).filter((argument) => argument !== node.arguments?.[index]));
+      }
+    }
+    if (deferredCalls.has(node)) deferredTargets.set(node, targets);
+    for (const declaration of targets) {
+      const calls = callsByFunction.get(declaration) ?? [];
+      if (calls.includes(node)) continue;
+      callsByFunction.set(declaration, [...calls, node]);
+      changed = true;
+      for (const [index, parameter] of declaration.parameters.entries()) {
+        if (parameter.dotDotDotToken) {
+          restArgumentsByParameter.set(parameter, [...(restArgumentsByParameter.get(parameter) ?? []), [...(node.arguments ?? [])].slice(index)]);
+          continue;
+        }
+        const argument = node.arguments?.[index];
+        if (argument) argumentsByParameter.set(parameter, [...(argumentsByParameter.get(parameter) ?? []), argument]);
+      }
+    }
+    return changed;
+  }
+  for (const source of sources) walk(source, (node) => {
+    if (!workLimitReached && (ts.isCallExpression(node) || ts.isNewExpression(node))) indexCall(node, callDeclarations);
+  });
+  let changedDefaultCalls = deferredCalls.size > 0;
+  while (changedDefaultCalls && !workLimitReached) {
+    changedDefaultCalls = false;
+    // Defaults depend on the completed caller map; each changed pass gets fresh memoization.
+    const resolveDefaults = createCallTargetResolver({ ...resolverOptions, parameterArguments(parameter) {
+      const index = parameter.parent.parameters.indexOf(parameter);
+      return (callsByFunction.get(parameter.parent) ?? []).map((call) => {
+        const argument = call.arguments?.[index];
+        const isUndefined = argument && ts.isIdentifier(argument) && argument.text === "undefined" && !checker.getSymbolAtLocation(argument)?.valueDeclaration;
+        return !argument || isUndefined || ts.isVoidExpression(argument) ? parameter.initializer : argument;
+      });
+    } });
+    for (const node of deferredCalls) {
+      if (workLimitReached) break;
+      unresolvedCallTargets.delete(node);
+      changedDefaultCalls = indexCall(node, resolveDefaults) || changedDefaultCalls;
+    }
+  }
+
+  let directCache = new WeakMap();
+  const directResolving = new Set();
+  function directSelect(value, key) {
+    if (!value) return undefined;
+    if (["api", "runtime"].includes(value.kind) || value.kind === "namespace" && value.module) return selectValue(value, key);
+    if (value.kind === "union") return combine(value.values.map((item) => directSelect(item, key)));
+    if (value.kind === "object") {
+      // A spread can replace an earlier alias, so only use the final explicit field.
+      for (const item of [...value.node.properties].reverse()) {
+        if (ts.isSpreadAssignment(item)) return undefined;
+        if (nameText(item.name) === key) return directResolve(ts.isShorthandPropertyAssignment(item) ? item.name : item.initializer ?? item);
+      }
+    }
+    return undefined;
+  }
+  function directResolve(node) {
+    if (!node || directResolving.has(node)) return undefined;
+    if (directCache.has(node)) return directCache.get(node);
+    directResolving.add(node);
+    let value;
+    if (ts.isIdentifier(node)) {
+      const symbol = checker.getSymbolAtLocation(node);
+      for (const declaration of symbol?.declarations ?? []) {
+        if (entryParameters.has(declaration)) value = { kind: "api", path: [], type: checker.getTypeAtLocation(declaration) };
+        else if (ts.isImportSpecifier(declaration)) {
+          const name = declaration.parent.parent.parent.moduleSpecifier.text;
+          if (isSdkSpecifier(name)) value = sdkExport(name, (declaration.propertyName ?? declaration.name).text);
+        } else if (ts.isNamespaceImport(declaration) || ts.isImportClause(declaration)) {
+          const name = ts.isNamespaceImport(declaration) ? declaration.parent.parent.moduleSpecifier.text : declaration.parent.moduleSpecifier.text;
+          if (isSdkSpecifier(name)) value = ts.isNamespaceImport(declaration) ? moduleValue(name) : sdkExport(name, "default");
+        } else if (ts.isImportEqualsDeclaration(declaration) && ts.isExternalModuleReference(declaration.moduleReference)) {
+          const name = declaration.moduleReference.expression?.text;
+          if (isSdkSpecifier(name)) value = moduleValue(name, undefined, declaration.isTypeOnly ? undefined : "require");
+        } else if (ts.isVariableDeclaration(declaration)) value = directResolve(declaration.initializer);
+        else if (ts.isFunctionDeclaration(declaration)) value = { kind: "function", node: declaration, scope };
+        if (value) break;
+      }
+    } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const receiver = directResolve(node.expression);
+      const key = ts.isPropertyAccessExpression(node) ? node.name.text : node.argumentExpression && (ts.isStringLiteralLike(node.argumentExpression) || ts.isNumericLiteral(node.argumentExpression)) ? node.argumentExpression.text : undefined;
+      value = receiver && isBuiltinProperty(node) ? builtinBoundary(receiver, node.expression) : directSelect(receiver, key);
+    } else if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node) || ts.isAwaitExpression(node)) value = directResolve(node.expression);
+    else if (ts.isObjectLiteralExpression(node)) value = { kind: "object", node, scope };
+    else if (ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node)) value = { kind: "function", node, scope };
+    else if (ts.isCallExpression(node) && node.arguments[0] && ts.isStringLiteralLike(node.arguments[0]) && isSdkSpecifier(node.arguments[0].text)) {
+      const dynamic = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const required = ts.isIdentifier(node.expression) && node.expression.text === "require" && !checker.getSymbolAtLocation(node.expression)?.valueDeclaration;
+      if (dynamic || required) value = moduleValue(node.arguments[0].text, node.getSourceFile(), dynamic ? "dynamic-import" : "require");
+    }
+    directResolving.delete(node);
+    directCache.set(node, value);
+    return value;
+  }
 
   function moduleValue(specifier, source, dependencyKind) {
     if (isSdkSpecifier(specifier)) return { kind: "namespace", module: specifier, dependencyKind };
@@ -51,7 +171,7 @@ export function createProvenance({ checker, program, localSource, sources, targe
   }
 
   function exported(source, name) {
-    if (!source) return undefined;
+    if (!source || workLimitReached) return undefined;
     const key = `${source.fileName}#${name}`;
     if (exporting.has(key)) return undefined;
     exporting.add(key);
@@ -90,6 +210,9 @@ export function createProvenance({ checker, program, localSource, sources, targe
   const selecting = new WeakMap();
   function select(value, key) {
     if (!value || key === undefined) return undefined;
+    // Direct SDK imports remain enumerable after complex argument flow stops.
+    if (value.kind === "namespace" && value.module) return selectValue(value, key);
+    if (!consumeWork()) return directSelect(value, key);
     // A recursive helper can rebuild the same spread node in fresh call scopes.
     // Guard its source identity, not the temporary wrapper object's identity.
     const identity = value.node ?? value;
@@ -154,7 +277,15 @@ export function createProvenance({ checker, program, localSource, sources, targe
   }
 
   function combine(values) {
-    const defined = values.filter(Boolean);
+    const seen = new Set();
+    const defined = [];
+    function append(value) {
+      if (!value || seen.has(value)) return;
+      seen.add(value);
+      if (value.kind === "union") for (const item of value.values) append(item);
+      else defined.push(value);
+    }
+    for (const value of values) append(value);
     if (!defined.length) return undefined;
     if (defined.length === 1) return defined[0];
     return { kind: "union", values: defined };
@@ -196,16 +327,18 @@ export function createProvenance({ checker, program, localSource, sources, targe
     return { bindings, literalBindings, functions: new Set([...lexicalScope.functions, fn]), cache: new WeakMap() };
   }
 
-  function invocationScopes(fn, seen = new Set()) {
-    if (seen.has(fn) || scope.functions.has(fn)) return [scope];
+  function* invocationScopes(fn, seen = new Set()) {
+    if (!consumeWork(fn.name)) return;
+    if (seen.has(fn) || scope.functions.has(fn)) { yield scope; return; }
     const calls = callsByFunction.get(fn);
-    if (!calls?.length) return [scope];
+    if (!calls?.length) { yield scope; return; }
     const next = new Set([...seen, fn]);
-    return calls.flatMap((call) => {
+    for (const call of calls) {
+      if (workLimitReached) return;
       const caller = enclosingFunction(call);
       const contexts = caller ? invocationScopes(caller, next) : [scope];
-      return contexts.map((context) => inScope(context, () => invocationScope(fn, call.arguments ?? [])));
-    });
+      for (const context of contexts) yield inScope(context, () => invocationScope(fn, call.arguments ?? []));
+    }
   }
 
   function elementValue(node) {
@@ -214,8 +347,15 @@ export function createProvenance({ checker, program, localSource, sources, targe
     // Call correlation only matters when callers supply different known keys.
     // A fixed key needs no call graph expansion; an unknown key cannot become
     // a concrete SDK identity by enumerating unrelated caller contexts.
-    return literals(node.argumentExpression).length > 1 && fn && !scope.functions.has(fn) && callsByFunction.has(fn)
-      ? combine(invocationScopes(fn).map((context) => inScope(context, evaluate))) : evaluate();
+    if (literals(node.argumentExpression).length > 1 && fn && !scope.functions.has(fn) && callsByFunction.has(fn)) {
+      const values = [];
+      for (const context of invocationScopes(fn)) {
+        const value = inScope(context, evaluate);
+        if (value) values.push(value);
+      }
+      return combine(values);
+    }
+    return evaluate();
   }
 
   function declarationValue(declaration) {
@@ -304,6 +444,7 @@ export function createProvenance({ checker, program, localSource, sources, targe
   function resolve(node) {
     if (!node) return undefined;
     if (scope.cache.has(node)) return scope.cache.get(node);
+    if (!consumeWork(node)) return directResolve(node);
     if (resolving.has(node)) return undefined;
     resolving.add(node);
     let value;
@@ -388,8 +529,9 @@ export function createProvenance({ checker, program, localSource, sources, targe
 
   function literals(node, seen = new Set()) {
     if (!node || seen.has(node)) return [];
-    seen.add(node);
     if (ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) return [node.text];
+    if (!consumeWork(node)) return [];
+    seen.add(node);
     if (ts.isAsExpression(node) || ts.isParenthesizedExpression(node)) return literals(node.expression, seen);
     if (ts.isIdentifier(node)) {
       const declaration = checker.getSymbolAtLocation(node)?.valueDeclaration;
@@ -413,7 +555,12 @@ export function createProvenance({ checker, program, localSource, sources, targe
   }
 
   for (const source of entrypoints) {
-    let entry = exported(source, "default") ?? { kind: "namespace", source };
+    const defaultExport = source.statements.find(ts.isExportAssignment);
+    let entry = exported(source, "default") ?? directResolve(defaultExport?.expression) ?? { kind: "namespace", source };
+    if (workLimitReached && entry.kind === "namespace") {
+      const namedRegister = source.statements.find((statement) => ts.isFunctionDeclaration(statement) && statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) && (statement.name?.text === "register" || statement.modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)));
+      if (namedRegister) entry = { kind: "function", node: namedRegister, scope };
+    }
     const seen = new Set();
     for (let depth = 0; entry && !seen.has(entry) && depth < 12; depth++) {
       seen.add(entry);
@@ -427,6 +574,8 @@ export function createProvenance({ checker, program, localSource, sources, targe
   }
   // Entry discovery may resolve aliases before their API parameters are marked.
   scope.cache = new WeakMap();
+  // Direct entry discovery may also have observed an as-yet unmarked parameter.
+  directCache = new WeakMap();
 
-  return { resolve, select, exported, moduleValue, literal, literals, typeValue };
+  return { resolve, select, exported, moduleValue, literal, literals, hasUnresolvedCallTarget: (node) => unresolvedCallTargets.has(node), typeValue: (node) => consumeWork(node) ? typeValue(node) : undefined };
 }
