@@ -924,8 +924,7 @@
       "docsPath": "/plugins/sdk-migration/how-to-migrate#await-locked-transcript-preparation",
       "replacementExports": [
         "withSessionTranscriptWrite",
-        "withCodexSessionTranscriptMirrorWrite",
-        "prepareMessage"
+        "withCodexSessionTranscriptMirrorWrite"
       ]
     },
     {
@@ -954,7 +953,6 @@
       "removeAfter": "2026-12-31",
       "docsPath": "/plugins/sdk-migration/how-to-migrate#await-strict-transcript-message-preparation",
       "replacementExports": [
-        "prepareMessage",
         "appendSessionTranscriptMessageByIdentityStrict",
         "appendSessionTranscriptMessageByIdentity"
       ]

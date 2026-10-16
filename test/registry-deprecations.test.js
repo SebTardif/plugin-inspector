@@ -230,7 +230,10 @@ test("packed targets omit session advice until every named replacement is export
   await writeFile(path.join(target, "package.json"), JSON.stringify({
     name: "openclaw",
     version: "2026.10.16",
-    exports: { "./plugin-sdk/session-store-runtime": "./dist/plugin-sdk/session-store-runtime.js" },
+    exports: {
+      ".": "./dist/index.js",
+      "./plugin-sdk/session-store-runtime": "./dist/plugin-sdk/session-store-runtime.js",
+    },
   }));
   await writeFile(path.join(target, "dist/plugin-sdk/session-store-runtime.d.ts"), [
     "export declare function getSessionEntryAsync(sessionKey: string): Promise<unknown>;",
@@ -248,6 +251,48 @@ test("packed targets omit session advice until every named replacement is export
   const prescribed = JSON.stringify(report.issues.concat(report.warnings, report.fixtures[0].sdkDeprecations));
   assert.equal(prescribed.includes("loadTranscriptEvents"), false);
   assert.equal(report.issues.some((item) => item.code === "sdk-deprecated-api"), false);
+});
+
+test("reachable public type members satisfy a runtime replacement", () => {
+  const record = {
+    code: "tts-preferences-sync-resolution",
+    status: "deprecated",
+    replacementExports: ["buildSystemPromptHintAsync"],
+  };
+  const packageJson = { exports: { "./plugin-sdk": "./dist/plugin-sdk/index.js" } };
+  const kept = retirementRecordsForPackedTarget([record], {
+    packageRoot: "/openclaw",
+    packageJson,
+    declarations: [
+      {
+        filePath: "/openclaw/dist/plugin-sdk/index.d.ts",
+        source: 'import type { PluginRuntimeCore } from "./runtime-core.js";\nexport interface PluginRuntime extends PluginRuntimeCore {}\n',
+      },
+      {
+        filePath: "/openclaw/dist/plugin-sdk/runtime-core.d.ts",
+        source: "export interface PluginRuntimeCore {\n  buildSystemPromptHintAsync(): string;\n}\n",
+      },
+    ],
+  });
+  assert.equal(kept.length, 1);
+});
+
+test("transcript write replacements do not require the caller prepareMessage callback", () => {
+  const record = sdkRetirements.records.find((item) => item.code === "transcript-lock-sync-message-preparation");
+  assert.equal(record.replacementExports.includes("prepareMessage"), false);
+  const kept = retirementRecordsForPackedTarget([record], {
+    packageRoot: "/openclaw",
+    packageJson: { exports: { "./plugin-sdk/transcript": "./dist/plugin-sdk/transcript.js" } },
+    declarations: [{
+      filePath: "/openclaw/dist/plugin-sdk/transcript.d.ts",
+      source: [
+        "export declare function withSessionTranscriptWrite(): unknown;",
+        "export declare function withCodexSessionTranscriptMirrorWrite(): unknown;",
+        "",
+      ].join("\n"),
+    }],
+  });
+  assert.equal(kept.length, 1);
 });
 
 test("session retirement lists every replacement the guidance names", () => {

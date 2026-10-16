@@ -14,21 +14,31 @@ export function retirementRecordsForPackedTarget(records, { declarations = [], p
 }
 
 function publicReplacementNames(declarations, packageJson, packageRoot) {
-  const names = new Set();
+  const byStem = new Map();
   for (const declaration of declarations) {
-    if (!isPublicSdkDeclaration(declaration.filePath, packageJson, packageRoot)) continue;
-    for (const name of exportedDeclarationNames(declaration.source ?? "")) names.add(name);
+    byStem.set(declarationStem(declaration.filePath, packageRoot), declaration);
+  }
+  const names = new Set();
+  const seen = new Set();
+  const queue = pluginSdkExportStems(packageJson);
+  while (queue.length > 0) {
+    const stem = queue.shift();
+    if (seen.has(stem)) continue;
+    seen.add(stem);
+    const declaration = byStem.get(stem);
+    if (!declaration) continue;
+    const source = declaration.source ?? "";
+    for (const name of exportedDeclarationNames(source)) names.add(name);
+    queue.push(...relativeDeclarationStems(source, stem));
   }
   return names;
 }
 
-function isPublicSdkDeclaration(filePath, packageJson, packageRoot) {
-  const relativeFile = path.relative(packageRoot, filePath).split(path.sep).join("/");
-  const declarationStem = relativeFile.replace(/\.d\.ts$/, "");
-  return exportStems(packageJson).some((stem) => declarationStem === stem);
+function declarationStem(filePath, packageRoot) {
+  return path.relative(packageRoot, filePath).split(path.sep).join("/").replace(/\.d\.ts$/, "");
 }
 
-function exportStems(packageJson) {
+function pluginSdkExportStems(packageJson) {
   const stems = [];
   const visit = (value) => {
     if (typeof value === "string") {
@@ -37,7 +47,20 @@ function exportStems(packageJson) {
       for (const child of Object.values(value)) visit(child);
     }
   };
-  visit(packageJson.exports ?? {});
+  for (const [specifier, value] of Object.entries(packageJson.exports ?? {})) {
+    if (specifier !== "./plugin-sdk" && !specifier.startsWith("./plugin-sdk/")) continue;
+    visit(value);
+  }
+  return stems;
+}
+
+function relativeDeclarationStems(source, fromStem) {
+  const text = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  const stems = [];
+  for (const match of text.matchAll(/\bfrom\s+["'](\.[^"']+)["']/g)) {
+    const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(fromStem), match[1]));
+    stems.push(resolved.replace(/\.(?:[cm]?js|d\.ts)$/, ""));
+  }
   return stems;
 }
 
