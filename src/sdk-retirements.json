@@ -87,7 +87,23 @@
       "removeAfter": "2026-12-31",
       "docsPath": "/plugins/sdk-migration/how-to-migrate#migrate-inspection-authorization-and-approval-factories",
       "replacementExports": [
-        "resolveApprovalRequestSessionDeliveryAsync"
+        "resolveApprovalRequestSessionDeliveryAsync",
+        "createChannelExecApprovalProfileAsync",
+        "createApproverRestrictedNativeApprovalCapabilityAsync",
+        "createApproverRestrictedNativeApprovalCapabilityFromForwardingRoutesAsync",
+        "createLazyChannelApprovalNativeRuntimeAdapterAsync",
+        "createChannelApprovalNativeRuntimeAdapterAsync",
+        "createChannelApproverDmTargetResolverAsync",
+        "createChannelNativeOriginTargetResolverAsync",
+        "createNativeApprovalChannelRouteGatesAsync",
+        "createNativeApprovalForwardingFallbackSuppressorAsync",
+        "doesApprovalRequestSelectChannelAccountAsync",
+        "resolveApprovalRequestAccountIdAsync",
+        "resolveApprovalRequestChannelAccountIdAsync",
+        "doesApprovalRequestMatchChannelAccountAsync",
+        "resolveApprovalRequestOriginTargetAsync",
+        "resolveApprovalRequestSessionTargetAsync",
+        "resolveExecApprovalSessionTargetAsync"
       ]
     },
     {
@@ -985,7 +1001,6 @@
       "docsPath": "/plugins/sdk-migration/compatibility-policy#watched-session-harness-context",
       "replacementExports": [
         "prepareWatchedSessionsHarnessContext",
-        "assertCurrent",
         "buildWatchedSessionsHarnessContext"
       ]
     },

@@ -254,27 +254,39 @@ test("packed targets omit session advice until every named replacement is export
 });
 
 test("reachable public type members satisfy a runtime replacement", () => {
-  const record = {
-    code: "tts-preferences-sync-resolution",
-    status: "deprecated",
-    replacementExports: ["buildSystemPromptHintAsync"],
-  };
   const packageJson = { exports: { "./plugin-sdk": "./dist/plugin-sdk/index.js" } };
-  const kept = retirementRecordsForPackedTarget([record], {
-    packageRoot: "/openclaw",
-    packageJson,
-    declarations: [
-      {
-        filePath: "/openclaw/dist/plugin-sdk/index.d.ts",
-        source: 'import type { PluginRuntimeCore } from "./runtime-core.js";\nexport interface PluginRuntime extends PluginRuntimeCore {}\n',
-      },
-      {
-        filePath: "/openclaw/dist/plugin-sdk/runtime-core.d.ts",
-        source: "export interface PluginRuntimeCore {\n  buildSystemPromptHintAsync(): string;\n}\n",
-      },
-    ],
-  });
-  assert.equal(kept.length, 1);
+  const declarations = [
+    {
+      filePath: "/openclaw/dist/plugin-sdk/index.d.ts",
+      source: 'import type { PluginRuntimeCore } from "./runtime-core.js";\nexport interface PluginRuntime extends PluginRuntimeCore {}\n',
+    },
+    {
+      filePath: "/openclaw/dist/plugin-sdk/runtime-core.d.ts",
+      source: [
+        "export interface PluginRuntimeCore {",
+        "  buildSystemPromptHintAsync(): string;",
+        "  openKeyedStoreV2: <T>(value: T) => T;",
+        "}",
+        "export declare function loadTranscriptEvents(): unknown;",
+        "",
+      ].join("\n"),
+    },
+  ];
+  const kept = retirementRecordsForPackedTarget([
+    { code: "tts", status: "deprecated", replacementExports: ["buildSystemPromptHintAsync"] },
+    { code: "state", status: "deprecated", replacementExports: ["openKeyedStoreV2"] },
+    { code: "session", status: "deprecated", replacementExports: ["loadTranscriptEvents"] },
+  ], { packageRoot: "/openclaw", packageJson, declarations });
+  assert.deepEqual(kept.map((record) => record.code), ["tts", "state"]);
+});
+
+test("watched-session advice does not require the caller assertCurrent callback", () => {
+  const record = sdkRetirements.records.find((item) => item.code === "watched-sessions-sync-harness-context");
+  assert.equal(record.replacementExports.includes("assertCurrent"), false);
+  assert.equal(
+    sdkRetirements.records.find((item) => item.code === "approval-routing-sync-preparation").replacementExports.includes("createChannelExecApprovalProfileAsync"),
+    true,
+  );
 });
 
 test("transcript write replacements do not require the caller prepareMessage callback", () => {

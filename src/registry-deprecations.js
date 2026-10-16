@@ -19,19 +19,44 @@ function publicReplacementNames(declarations, packageJson, packageRoot) {
     byStem.set(declarationStem(declaration.filePath, packageRoot), declaration);
   }
   const names = new Set();
-  const seen = new Set();
-  const queue = pluginSdkExportStems(packageJson);
-  while (queue.length > 0) {
-    const stem = queue.shift();
-    if (seen.has(stem)) continue;
-    seen.add(stem);
-    const declaration = byStem.get(stem);
-    if (!declaration) continue;
-    const source = declaration.source ?? "";
-    for (const name of exportedDeclarationNames(source)) names.add(name);
-    queue.push(...relativeDeclarationStems(source, stem));
+  const seenFiles = new Set();
+  for (const stem of pluginSdkExportStems(packageJson)) {
+    collectPublicNames(stem, byStem, names, seenFiles);
   }
   return names;
+}
+
+function collectPublicNames(stem, byStem, names, seenFiles) {
+  if (seenFiles.has(stem)) return;
+  const declaration = byStem.get(stem);
+  if (!declaration) return;
+  seenFiles.add(stem);
+  const source = declaration.source ?? "";
+  for (const name of exportedDeclarationNames(source)) names.add(name);
+  for (const reexport of reexportsFrom(source, stem)) {
+    if (reexport.all) {
+      collectPublicNames(reexport.stem, byStem, names, seenFiles);
+      continue;
+    }
+    names.add(reexport.publicName);
+    addReferencedTypeMembers(reexport.stem, reexport.importedName, byStem, names);
+  }
+  for (const binding of importedBindings(source, stem)) {
+    if (!usesImportedType(source, binding.local)) continue;
+    addReferencedTypeMembers(binding.stem, binding.imported, byStem, names);
+  }
+}
+
+function addReferencedTypeMembers(stem, typeName, byStem, names) {
+  const declaration = byStem.get(stem);
+  if (!declaration || !typeName) return;
+  const source = declaration.source ?? "";
+  for (const member of membersOfNamedType(source, typeName)) names.add(member);
+  const parent = extendedTypeName(source, typeName);
+  if (!parent) return;
+  const parentBinding = importedBindings(source, stem).find((binding) => binding.local === parent);
+  if (parentBinding) addReferencedTypeMembers(parentBinding.stem, parentBinding.imported, byStem, names);
+  else for (const member of membersOfNamedType(source, parent)) names.add(member);
 }
 
 function declarationStem(filePath, packageRoot) {
@@ -54,14 +79,77 @@ function pluginSdkExportStems(packageJson) {
   return stems;
 }
 
-function relativeDeclarationStems(source, fromStem) {
-  const text = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
-  const stems = [];
-  for (const match of text.matchAll(/\bfrom\s+["'](\.[^"']+)["']/g)) {
-    const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(fromStem), match[1]));
-    stems.push(resolved.replace(/\.(?:[cm]?js|d\.ts)$/, ""));
+function resolveRelativeStem(fromStem, specifier) {
+  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(fromStem), specifier));
+  return resolved.replace(/\.(?:[cm]?js|d\.ts)$/, "");
+}
+
+function strippedDeclaration(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+}
+
+function importedBindings(source, fromStem) {
+  const bindings = [];
+  for (const match of strippedDeclaration(source).matchAll(/\bimport\s+(?:type\s+)?\{([^}]+)\}\s+from\s+["'](\.[^"']+)["']/g)) {
+    for (const part of match[1].split(",")) {
+      const names = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(part.trim());
+      if (!names) continue;
+      bindings.push({
+        imported: names[1],
+        local: names[2] ?? names[1],
+        stem: resolveRelativeStem(fromStem, match[2]),
+      });
+    }
   }
-  return stems;
+  return bindings;
+}
+
+function reexportsFrom(source, fromStem) {
+  const reexports = [];
+  const text = strippedDeclaration(source);
+  for (const match of text.matchAll(/\bexport\s+(?:type\s+)?\{([^}]+)\}\s+from\s+["'](\.[^"']+)["']/g)) {
+    const stem = resolveRelativeStem(fromStem, match[2]);
+    for (const part of match[1].split(",")) {
+      const names = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(part.trim());
+      if (!names) continue;
+      reexports.push({ all: false, stem, importedName: names[1], publicName: names[2] ?? names[1] });
+    }
+  }
+  for (const match of text.matchAll(/\bexport\s+\*\s+from\s+["'](\.[^"']+)["']/g)) {
+    reexports.push({ all: true, stem: resolveRelativeStem(fromStem, match[1]) });
+  }
+  return reexports;
+}
+
+function usesImportedType(source, localName) {
+  const text = strippedDeclaration(source).replace(/^import[\s\S]*?from\s+["'][^"']+["'];?$/gm, "");
+  const mention = new RegExp(`\\b${localName}\\b`);
+  for (const match of text.matchAll(/\bexport\s+(?:declare\s+)?(?:interface|type|class)\s+[^{;]+/g)) {
+    if (mention.test(match[0])) return true;
+  }
+  for (const match of text.matchAll(/\bexport\s+(?:declare\s+)?(?:interface|type)\s+[A-Za-z_$][\w$]*[^{=]*=?\s*\{([\s\S]*?)\n\}/g)) {
+    if (mention.test(match[0])) return true;
+  }
+  return false;
+}
+
+function extendedTypeName(source, typeName) {
+  const match = strippedDeclaration(source).match(new RegExp(`\\b(?:interface|type)\\s+${typeName}\\b[^{]*\\bextends\\s+([A-Za-z_$][\\w$]*)`));
+  return match?.[1] ?? null;
+}
+
+function membersOfNamedType(source, typeName) {
+  const match = strippedDeclaration(source).match(new RegExp(`\\b(?:export\\s+)?(?:declare\\s+)?(?:interface|type)\\s+${typeName}\\b[^{=]*=?\\s*\\{([\\s\\S]*?)\\n\\}`));
+  if (!match) return [];
+  return typeMembers(match[1]);
+}
+
+function typeMembers(body) {
+  const names = [];
+  for (const member of body.matchAll(/(?:^|\n)\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\s*[?(:]/g)) {
+    names.push(member[1]);
+  }
+  return names;
 }
 
 function exportedDeclarationNames(source) {
@@ -77,9 +165,7 @@ function exportedDeclarationNames(source) {
     }
   }
   for (const match of text.matchAll(/\bexport\s+(?:declare\s+)?(?:interface|type)\s+[A-Za-z_$][\w$]*[^{=]*=?\s*\{([\s\S]*?)\n\}/g)) {
-    for (const member of match[1].matchAll(/(?:^|\n)\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\s*[?(]/g)) {
-      names.add(member[1]);
-    }
+    for (const member of typeMembers(match[1])) names.add(member);
   }
   return names;
 }
