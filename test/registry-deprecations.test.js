@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { readOpenClawTargetSurface } from "../src/openclaw-target.js";
-import { replacementExportNames, retirementRecordsForPackedTarget } from "../src/registry-deprecations.js";
+import { retirementRecordsForPackedTarget } from "../src/registry-deprecations.js";
 import { inspectCompatibilityFixtureSet, inspectSourceText } from "../src/inspector.js";
 import sdkRetirements from "../src/sdk-retirements.json" with { type: "json" };
 
@@ -142,11 +142,8 @@ test("ClawHub-style packed targets use the pinned retirement inventory without r
   await mkdir(path.join(target, "dist"), { recursive: true });
   await mkdir(plugin);
   await writeFile(path.join(target, "package.json"), JSON.stringify({ name: "openclaw", version: "2026.10.1", exports: { "./plugin-sdk/sqlite-runtime": "./dist/sqlite.js" } }));
-  await writeFile(path.join(target, "dist/index.d.ts"), [
-    "export type PluginManifest = { id: string };",
-    "export declare function openOpenClawAgentSqliteWorkerStoreV2(): void;",
-    "",
-  ].join("\n"));
+  await writeFile(path.join(target, "dist/index.d.ts"), "export type PluginManifest = { id: string };\n");
+  await writeFile(path.join(target, "dist/sqlite.d.ts"), "export declare function openOpenClawAgentSqliteWorkerStoreV2(): void;\n");
   await writeFile(path.join(plugin, "index.js"), 'import { executeSqliteQuerySync } from "openclaw/plugin-sdk/sqlite-runtime";');
   const report = await inspectCompatibilityFixtureSet({ rootDir, fixtures: [{ id: "packed", path: "plugin", seams: [], expect: {} }] }, { openclawPath: target, authorFacing: true });
   assert.equal(report.targetOpenClaw.compatRegistryPath, null);
@@ -209,6 +206,7 @@ test("packed targets keep retirement advice when the replacement export exists",
     "export declare function getSessionEntryAsync(sessionKey: string): Promise<unknown>;",
     "export declare function getConversationSessionAsync(sessionKey: string): Promise<unknown>;",
     "export declare function readAmbientTranscriptWatermarkAsync(sessionKey: string): Promise<unknown>;",
+    "export declare function loadTranscriptEvents(sessionKey: string): unknown;",
     "",
   ].join("\n"));
   await writeFile(path.join(plugin, "index.js"), 'import { getSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";\n');
@@ -222,14 +220,63 @@ test("packed targets keep retirement advice when the replacement export exists",
   assert.equal(issue?.removeAfter, "2026-12-31");
 });
 
-test("replacement export names ignore prose and keep callable replacements", () => {
-  assert.deepEqual(replacementExportNames({
-    replacement: "Await getSessionEntryAsync, then keep the synchronous reader through 2026-12-31.",
-  }), ["getSessionEntryAsync"]);
-  assert.deepEqual(retirementRecordsForPackedTarget([
-    { code: "session-store-sync-readers", status: "deprecated", replacement: "Await getSessionEntryAsync." },
-    { code: "undated", status: "deprecated", replacement: "Consult the migration guide." },
-  ], "export declare function getSessionEntry(): unknown;").map((record) => record.code), ["undated"]);
+test("packed targets omit session advice until every named replacement is exported", async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "inspector-packed-partial-replacement-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const target = path.join(rootDir, "openclaw");
+  const plugin = path.join(rootDir, "plugin");
+  await mkdir(path.join(target, "dist/plugin-sdk"), { recursive: true });
+  await mkdir(plugin);
+  await writeFile(path.join(target, "package.json"), JSON.stringify({
+    name: "openclaw",
+    version: "2026.10.16",
+    exports: { "./plugin-sdk/session-store-runtime": "./dist/plugin-sdk/session-store-runtime.js" },
+  }));
+  await writeFile(path.join(target, "dist/plugin-sdk/session-store-runtime.d.ts"), [
+    "export declare function getSessionEntryAsync(sessionKey: string): Promise<unknown>;",
+    "export declare function getConversationSessionAsync(sessionKey: string): Promise<unknown>;",
+    "export declare function readAmbientTranscriptWatermarkAsync(sessionKey: string): Promise<unknown>;",
+    "/* loadTranscriptEvents is mentioned only in this comment */",
+    "",
+  ].join("\n"));
+  await writeFile(path.join(target, "dist/index.d.ts"), "export declare function loadTranscriptEvents(): unknown;\n");
+  await writeFile(path.join(plugin, "index.js"), 'import { getSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";\nvoid getSessionEntry;\n');
+  const report = await inspectCompatibilityFixtureSet({
+    rootDir,
+    fixtures: [{ id: "packed", path: "plugin", seams: [], expect: {} }],
+  }, { openclawPath: target, authorFacing: true });
+  const prescribed = JSON.stringify(report.issues.concat(report.warnings, report.fixtures[0].sdkDeprecations));
+  assert.equal(prescribed.includes("loadTranscriptEvents"), false);
+  assert.equal(report.issues.some((item) => item.code === "sdk-deprecated-api"), false);
+});
+
+test("session retirement lists every replacement the guidance names", () => {
+  const record = sdkRetirements.records.find((item) => item.code === "session-store-sync-readers");
+  assert.deepEqual(record.replacementExports, [
+    "getSessionEntryAsync",
+    "getConversationSessionAsync",
+    "readAmbientTranscriptWatermarkAsync",
+    "loadTranscriptEvents",
+  ]);
+  const available = new Set(record.replacementExports);
+  const kept = retirementRecordsForPackedTarget([record], {
+    declarations: [{
+      filePath: "/openclaw/dist/plugin-sdk/session-store-runtime.d.ts",
+      source: [...available].map((name) => `export declare function ${name}(): unknown;`).join("\n"),
+    }],
+    packageJson: { exports: { "./plugin-sdk/session-store-runtime": "./dist/plugin-sdk/session-store-runtime.js" } },
+    packageRoot: "/openclaw",
+  });
+  assert.equal(kept.length, 1);
+  const commented = retirementRecordsForPackedTarget([record], {
+    declarations: [{
+      filePath: "/openclaw/dist/plugin-sdk/session-store-runtime.d.ts",
+      source: `export declare function getSessionEntryAsync(): unknown;\n/* ${[...available].slice(1).join(" ")} */\n`,
+    }],
+    packageJson: { exports: { "./plugin-sdk/session-store-runtime": "./dist/plugin-sdk/session-store-runtime.js" } },
+    packageRoot: "/openclaw",
+  });
+  assert.deepEqual(commented, []);
 });
 
 test("packed inventory matches space-separated member names", () => {

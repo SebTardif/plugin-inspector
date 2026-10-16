@@ -485,10 +485,11 @@ async function readPackedOpenClawTargetSurface({ rootDir, requestedPaths, reques
     compatRecordCount: sdkRetirements.records.length,
     compatRecords: sdkRetirements.records.map((record) => record.code),
     compatRecordStatuses: Object.fromEntries(sdkRetirements.records.map((record) => [record.code, record.status])),
-    compatDeprecations: retirementRecordsForPackedTarget(
-      sdkRetirements.records,
-      declarations.map((declaration) => declaration.source).join("\n"),
-    ),
+    compatDeprecations: retirementRecordsForPackedTarget(sdkRetirements.records, {
+      declarations,
+      packageJson,
+      packageRoot: resolvedPath,
+    }),
     compatDeprecationsSource: sdkRetirements.source,
     compatRecordTests: {},
     compatRecordMissingTests: {},

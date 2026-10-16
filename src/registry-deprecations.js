@@ -1,36 +1,64 @@
+import path from "node:path";
 import { collectRuntimeModuleImports } from "./runtime-imports.js";
 
-// Names the retirement text tells an author to call. A packed npm target can
-// be older than this snapshot, so those names have to exist in its
-// declarations before the text is safe to show.
-export function replacementExportNames(record) {
-  const text = typeof record?.replacement === "string" ? record.replacement : "";
-  const names = [];
-  const seen = new Set();
-  const add = (name) => {
-    if (!name || name === "Async" || seen.has(name)) return;
-    seen.add(name);
-    names.push(name);
-  };
-  for (const match of text.matchAll(/\b([A-Za-z_$][\w$]*(?:Async|V\d+))\b/g)) add(match[1]);
-  for (const match of text.matchAll(/\b(?:Await|Use)\s+([A-Za-z_$][\w$]*)/g)) {
-    const name = match[1];
-    if (/[a-z][A-Z]/.test(name) || /(?:Async|V\d+)$/.test(name)) add(name);
+// replacementExports is the full list of calls a record tells the author to
+// use. A packed package can be older than this snapshot, so every name has to
+// be a public declaration export before that text is safe to show.
+export function retirementRecordsForPackedTarget(records, { declarations = [], packageJson = {}, packageRoot = "" } = {}) {
+  const available = publicReplacementNames(declarations, packageJson, packageRoot);
+  return records.filter((record) => {
+    const names = Array.isArray(record.replacementExports) ? record.replacementExports : [];
+    if (names.length === 0) return true;
+    return names.every((name) => available.has(name));
+  });
+}
+
+function publicReplacementNames(declarations, packageJson, packageRoot) {
+  const names = new Set();
+  for (const declaration of declarations) {
+    if (!isPublicSdkDeclaration(declaration.filePath, packageJson, packageRoot)) continue;
+    for (const name of exportedDeclarationNames(declaration.source ?? "")) names.add(name);
   }
   return names;
 }
 
-export function retirementRecordsForPackedTarget(records, declarationSource) {
-  const source = declarationSource ?? "";
-  return records.filter((record) => {
-    const names = replacementExportNames(record);
-    if (names.length === 0) return true;
-    return names.every((name) => new RegExp(`\\b${escapeRegExp(name)}\\b`).test(source));
-  });
+function isPublicSdkDeclaration(filePath, packageJson, packageRoot) {
+  const relativeFile = path.relative(packageRoot, filePath).split(path.sep).join("/");
+  const declarationStem = relativeFile.replace(/\.d\.ts$/, "");
+  return exportStems(packageJson).some((stem) => declarationStem === stem);
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+function exportStems(packageJson) {
+  const stems = [];
+  const visit = (value) => {
+    if (typeof value === "string") {
+      stems.push(value.replace(/^\.\//, "").replace(/\.(?:[cm]?js|d\.ts)$/, ""));
+    } else if (value && typeof value === "object") {
+      for (const child of Object.values(value)) visit(child);
+    }
+  };
+  visit(packageJson.exports ?? {});
+  return stems;
+}
+
+function exportedDeclarationNames(source) {
+  const text = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  const names = new Set();
+  for (const match of text.matchAll(/\bexport\s+(?:declare\s+)?(?:async\s+)?(?:function|const|class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/g)) {
+    names.add(match[1]);
+  }
+  for (const match of text.matchAll(/\bexport\s*\{([^}]+)\}/g)) {
+    for (const part of match[1].split(",")) {
+      const alias = /([A-Za-z_$][\w$]*)\s*$/.exec(part.trim());
+      if (alias) names.add(alias[1]);
+    }
+  }
+  for (const match of text.matchAll(/\bexport\s+(?:declare\s+)?(?:interface|type)\s+[A-Za-z_$][\w$]*[^{=]*=?\s*\{([\s\S]*?)\n\}/g)) {
+    for (const member of match[1].matchAll(/(?:^|\n)\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\s*[?(]/g)) {
+      names.add(member[1]);
+    }
+  }
+  return names;
 }
 
 function parseSurface(api) {
